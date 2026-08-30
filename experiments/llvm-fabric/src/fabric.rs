@@ -51,7 +51,7 @@ impl Fabric {
         self.place_cell_at(region, index, cell)
     }
 
-    fn place_cell_at(&mut self, region: RegionId, index: usize, mut cell: Cell) -> CellId {
+    fn place_cell_at(&mut self, region: RegionId, index: usize, cell: Cell) -> CellId {
         assert_eq!(cell.region, region, "cell.region must match placement region");
         let id = CellId(self.slab.len() as u32);
         self.slab.push(Some(cell.clone()));

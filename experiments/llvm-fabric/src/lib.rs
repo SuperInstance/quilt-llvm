@@ -10,3 +10,4 @@ pub mod id;
 pub mod ty;
 pub mod cell;
 pub mod fabric;
+pub mod text;
