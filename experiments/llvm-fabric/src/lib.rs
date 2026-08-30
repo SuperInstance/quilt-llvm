@@ -11,3 +11,5 @@ pub mod ty;
 pub mod cell;
 pub mod fabric;
 pub mod text;
+pub mod verify;
+pub mod fuzz;

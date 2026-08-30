@@ -101,6 +101,10 @@ impl Fabric {
         self.regions.get(r.0 as usize)
     }
 
+    pub fn region_mut(&mut self, r: RegionId) -> Option<&mut Region> {
+        self.regions.get_mut(r.0 as usize)
+    }
+
     pub fn entry(&self) -> Option<RegionId> {
         if self.regions.is_empty() {
             None
