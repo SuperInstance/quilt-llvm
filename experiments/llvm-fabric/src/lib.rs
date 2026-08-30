@@ -17,3 +17,5 @@ pub mod diff;
 pub mod conserve;
 pub mod replay;
 pub mod passes;
+pub mod prov;
+pub mod pipeline;

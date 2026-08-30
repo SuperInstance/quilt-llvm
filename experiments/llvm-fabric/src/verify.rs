@@ -238,7 +238,18 @@ pub fn verify(f: &Fabric) -> Result<(), VerifyError> {
                     }
                 }
             }
-            CellKind::Jump { .. } | CellKind::Ret => {}
+            CellKind::Jump { .. } => {}
+            CellKind::Ret => {
+                if let Some(&op) = c.operands.first() {
+                    let op_cell = f.cell(op).expect("V01 checked");
+                    if !op_cell.produces_value() {
+                        return Err(fail(
+                            "V15",
+                            format!("ret {} returns non-value cell {}", id, op),
+                        ));
+                    }
+                }
+            }
         }
 
         // V12: use-before-def for non-phi uses.
@@ -577,6 +588,27 @@ mod tests {
         f.add_cell(b, phi);
         f.add_cell(b, Cell::new(b, CellKind::Ret));
         assert_eq!(code_of(&f), "V14");
+    }
+
+    #[test]
+    fn v15_ret_of_non_value() {
+        let mut f = good();
+        let e = f.entry().unwrap();
+        let b = f.add_region("b");
+        // entry branches to b (twice); b's ret returns ENTRY'S BRANCH —
+        // a cross-region use of an entry cell, legal for V12, nonsense
+        // for V15
+        let mut br_id_holder = CellId(0);
+        swap_term(&mut f, e, |f| {
+            let bi1 = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+            let mut br = Cell::new(e, CellKind::Branch { then_r: b, else_r: b });
+            br.operands = vec![bi1];
+            br_id_holder = f.add_cell(e, br);
+        });
+        let mut r = Cell::new(b, CellKind::Ret);
+        r.operands = vec![br_id_holder];
+        f.add_cell(b, r);
+        assert_eq!(code_of(&f), "V15");
     }
 
     #[test]

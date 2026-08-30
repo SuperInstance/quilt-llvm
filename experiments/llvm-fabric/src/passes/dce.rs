@@ -5,7 +5,6 @@
 //! v0 scope (honest): unreachable REGIONS are not removed (their
 //! terminators count as roots); that's region-DCE, deferred to v1.
 
-use crate::cell::CellKind;
 use crate::diff::{DiffRecord, Edit};
 use crate::fabric::Fabric;
 use crate::id::CellId;
@@ -65,7 +64,7 @@ pub fn dce(f: &Fabric) -> Result<(Fabric, DiffRecord), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cell::{ArithOp, Cell};
+    use crate::cell::{ArithOp, Cell, CellKind};
     use crate::conserve;
     use crate::ty::{ConstVal, Type};
 

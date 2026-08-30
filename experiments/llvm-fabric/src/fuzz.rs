@@ -433,6 +433,8 @@ pub struct CorpusStats {
     pub mutated_still_valid: u64,
     pub rejected: BTreeMap<String, u64>,
     pub roundtrip_fail: u64,
+    pub prov_fail: u64,
+    pub replay_fail: u64,
     pub panics: u64, // can only be observed as a test/bin crash; kept for the report
 }
 
@@ -466,6 +468,41 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
             return Err(format!("seed {}: print/parse/print not stable", seed));
         }
 
+        // provenance walk from EVERY cell must terminate at roots
+        for id in f.cells() {
+            if let Err(e) = crate::prov::check_prov(&f, id) {
+                st.prov_fail += 1;
+                return Err(format!("seed {}: provenance of {} failed: {}", seed, id, e));
+            }
+        }
+
+        // pipeline + replay: history must reproduce every intermediate
+        // fabric bit-identically (structural + canonical text)
+        match crate::pipeline::run(&f) {
+            Ok((final_f, history, stages)) => {
+                match crate::replay::replay(&f, &history) {
+                    Ok((replayed, final_r)) => {
+                        if replayed.len() != stages.len()
+                            || stages.iter().zip(replayed.iter()).any(|(a, b)| a != b)
+                            || final_f != final_r
+                        {
+                            st.replay_fail += 1;
+                            return Err(format!("seed {}: replay diverged from pipeline", seed));
+                        }
+                    }
+                    Err(e) => {
+                        st.replay_fail += 1;
+                        return Err(format!("seed {}: replay failed: {}", seed, e));
+                    }
+                }
+                // conservation across the whole pipeline
+                if let Err(e) = crate::conserve::check_pipeline(&f, &final_f, &history) {
+                    return Err(format!("seed {}: pipeline conservation: {}", seed, e));
+                }
+            }
+            Err(e) => return Err(format!("seed {}: pipeline failed on valid fabric: {}", seed, e)),
+        }
+
         // mutations: verify must reject or accept WITH a reason-free panic never occurring
         if rng.chance(45) {
             let n = 1 + rng.below(3);
@@ -497,6 +534,8 @@ mod tests {
         let st = corpus_run(400, 0xFAB1C).expect("corpus invariants");
         assert_eq!(st.valid, 400);
         assert_eq!(st.roundtrip_fail, 0);
+        assert_eq!(st.prov_fail, 0);
+        assert_eq!(st.replay_fail, 0);
         assert!(st.mutated > 0, "mutations must actually happen");
         assert!(
             st.mutated_still_valid > 0,

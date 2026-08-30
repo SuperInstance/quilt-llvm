@@ -16,7 +16,9 @@ use crate::cell::{ArithOp, Cell, CellKind, CmpOp};
 use crate::diff::{DiffRecord, Edit};
 use crate::fabric::Fabric;
 use crate::id::CellId;
-use crate::ty::{ConstVal, Type};
+#[cfg(test)]
+use crate::ty::Type;
+use crate::ty::ConstVal;
 use crate::verify::verify;
 
 /// Fold one step of arithmetic. None = do not fold (overflow, div/0, NaN).
@@ -304,7 +306,7 @@ mod tests {
 
     #[test]
     fn refuses_unverified_input() {
-        let mut f = Fabric::empty(); // no regions -> V00
+        let f = Fabric::empty(); // no regions -> V00
         let err = const_fold(&f).unwrap_err();
         assert!(err.contains("refuses unverified"));
     }
