@@ -429,6 +429,7 @@ pub fn mutate(f: &Fabric, rng: &mut Rng) -> Fabric {
 pub struct CorpusStats {
     pub iters: u64,
     pub valid: u64,
+    pub cells_walked: u64, // provenance walks performed (one per cell)
     pub mutated: u64,
     pub mutated_still_valid: u64,
     pub rejected: BTreeMap<String, u64>,
@@ -456,6 +457,7 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
             return Err(format!("seed {}: generator produced invalid fabric: {}", seed, e));
         }
         st.valid += 1;
+        st.cells_walked += f.cells().count() as u64;
 
         // valid fabrics must round-trip through text
         let once = crate::text::print(&f);

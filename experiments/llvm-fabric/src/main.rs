@@ -87,6 +87,7 @@ fn cmd_fuzz(args: &[String]) {
         Ok(st) => {
             println!("iters:                 {}", st.iters);
             println!("valid (by generator):  {}", st.valid);
+            println!("cells provenance-walked: {}", st.cells_walked);
             println!("roundtrip failures:    {}", st.roundtrip_fail);
             println!("prov failures:         {}", st.prov_fail);
             println!("replay failures:       {}", st.replay_fail);
