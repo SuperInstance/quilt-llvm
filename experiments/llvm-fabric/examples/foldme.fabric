@@ -1,0 +1,11 @@
+; foldme.fabric — consts all the way down; the pipeline collapses it
+; and the ledger records every drop.
+fabric v0
+region entry
+  %0 = const i32 20
+  %1 = const i32 22
+  %2 = arith.add i32 %0, %1
+  %3 = const i32 100
+  %4 = cmp.lt %2, %3
+  %5 = const i64 7i64
+  %6 = ret %2

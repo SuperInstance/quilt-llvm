@@ -45,7 +45,15 @@ impl DiffRecord {
                         .region(cell.region)
                         .map(|r| r.name.as_str())
                         .unwrap_or("<bad>");
-                    out.push_str(&format!("  + {} @ {}[{}] :: {}\n", id, rname, index, crate::text::render_cell(f, *id)));
+                    // Render from the STORED cell: it may already be gone
+                    // from the final fabric the history is rendered against.
+                    out.push_str(&format!(
+                        "  + {} @ {}[{}] :: {}\n",
+                        id,
+                        rname,
+                        index,
+                        render_standalone(f, *id, cell)
+                    ));
                 }
                 Edit::RemoveCell { id, ledger, summary } => {
                     out.push_str(&format!("  - {} ({}) :: {}\n", id, ledger, summary));
@@ -56,6 +64,47 @@ impl DiffRecord {
             }
         }
         out
+    }
+}
+
+/// Render a cell stored inside an AddCell edit (it may no longer exist
+/// in the fabric the history is rendered against).
+fn render_standalone(f: &crate::fabric::Fabric, id: CellId, cell: &crate::cell::Cell) -> String {
+    use crate::cell::CellKind;
+    let o = |i: usize| -> String {
+        cell.operands
+            .get(i)
+            .map(|x| x.to_string())
+            .unwrap_or_else(|| "%<missing>".into())
+    };
+    match &cell.kind {
+        CellKind::Param { ty } => format!("{} = param {}", id, ty.name()),
+        CellKind::Const { ty, val } => format!("{} = const {} {}", id, ty.name(), val.render()),
+        CellKind::Arith { op, ty } => format!("{} = {} {} {}, {}", id, op.name(), ty.name(), o(0), o(1)),
+        CellKind::Cmp { op } => format!("{} = {} {}, {}", id, op.name(), o(0), o(1)),
+        CellKind::Branch { then_r, else_r } => format!(
+            "{} = br {}, {}, {}",
+            id,
+            o(0),
+            f.region_name(*then_r),
+            f.region_name(*else_r)
+        ),
+        CellKind::Jump { target } => format!("{} = jump {}", id, f.region_name(*target)),
+        CellKind::Phi { joins } => {
+            let parts: Vec<String> = joins
+                .iter()
+                .zip(cell.operands.iter())
+                .map(|(r, v)| format!("[{}: {}]", f.region_name(*r), v))
+                .collect();
+            format!("{} = phi {}", id, parts.join(" "))
+        }
+        CellKind::Ret => {
+            if cell.operands.is_empty() {
+                format!("{} = ret", id)
+            } else {
+                format!("{} = ret {}", id, o(0))
+            }
+        }
     }
 }
 

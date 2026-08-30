@@ -19,3 +19,4 @@ pub mod replay;
 pub mod passes;
 pub mod prov;
 pub mod pipeline;
+pub mod bench;
