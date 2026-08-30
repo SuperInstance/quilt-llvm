@@ -13,3 +13,6 @@ pub mod fabric;
 pub mod text;
 pub mod verify;
 pub mod fuzz;
+pub mod diff;
+pub mod conserve;
+pub mod replay;
