@@ -42,3 +42,27 @@ the pass and green with it. Archive-by-rename; nothing destroyed.
 - [ ] Architecture doc (dissertation-grade: cells as IR, the theory)
 - [ ] Cell IR v0 + verifier
 - [ ] First real pass + red/green tests
+
+### Docs (this expanse landed 2026-08-30 — all design-intent until code exists)
+
+- **[docs/THEORY.md](docs/THEORY.md)** — the essay: why a compiler IR
+  should be a fabric. Cells as values, wires as uses, regions as
+  blocks; N4 (append-only history) as pass semantics; conservation
+  (quilt-verilog F3's lesson, promoted) as IR semantics; provenance as
+  a first-class queryable structure; honest relations to quilt-verilog,
+  zeroclaw THESIS-V3, and MLIR.
+- **[docs/DOCTRINE.md](docs/DOCTRINE.md)** — the eight working laws
+  binding every lane: red/green pass tests, reachable hashes, measured
+  numbers, conservation ledger, append-only history, archive-by-rename,
+  verification-before-report, undersell/label-intent. One page,
+  enforceable.
+- **[docs/TUTORIAL.md](docs/TUTORIAL.md)** — compile a program you can
+  watch: a tiny function walked by hand through the planned v0 textual
+  IR — parse to fabric, constant fold as an appended diff, DCE as
+  deletion-with-paperwork, provenance walk back to the parse, replay
+  to any earlier tick. Labeled design-intent; the experiments lane
+  makes it real or corrects it.
+- **[docs/GLOSSARY.md](docs/GLOSSARY.md)** — fleet words and compiler
+  words mapped to each other exactly (cell↔value, wire↔use,
+  region↔block, tick↔pass, ledger↔def-use accounting…), with the real
+  collisions (fold, tick) resolved by written rule.
