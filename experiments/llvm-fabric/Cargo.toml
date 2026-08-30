@@ -1,0 +1,12 @@
+[package]
+name = "llvm-fabric"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "llvm_fabric"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llvm-fabric"
+path = "src/main.rs"
