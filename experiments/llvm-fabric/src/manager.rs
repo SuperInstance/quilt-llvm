@@ -166,6 +166,12 @@ impl PassManager {
                     tick, name, e
                 ));
             }
+            if let Err(e) = conserve::population_audit(&cur, &next, &rec) {
+                return Err(format!(
+                    "manager: tick {} pass {} failed the population audit: {}",
+                    tick, name, e
+                ));
+            }
             let rec_pass = rec.pass;
             h.push_tick(rec, &next);
             let advanced = !h.records[tick as usize].edits.is_empty();
@@ -323,8 +329,9 @@ mod tests {
             .err()
             .expect("overlapping edits must be rejected");
         // conserve passes (each removal is ledgered), verify passes —
-        // replay is the layer that refuses to apply the second removal
-        assert!(err.contains("replay"), "{}", err);
+        // the population audit now refuses the duplicate at the tick
+        // (ledger multiplication); replay remains the post-run backstop
+        assert!(err.contains("population audit"), "{}", err);
     }
 
     #[test]
@@ -454,8 +461,9 @@ mod tests {
     ) -> Result<(Fabric, DiffRecord), String> {
         // claims a removal it did not perform: the fabric still has the
         // cell, but the diff says it was removed. Conservation alone
-        // misses this (the removal is listed); REPLAY reconciliation
-        // is what catches a lying diff.
+        // misses this (the removal is listed); the population audit
+        // (lifecycle coupling) now catches it at the tick, with replay
+        // reconciliation as the post-run backstop.
         let mut rec = DiffRecord::new("phantom");
         let victim = f.cells().next().expect("nonempty");
         rec.edits.push(Edit::RemoveCell {
@@ -474,8 +482,8 @@ mod tests {
             .err()
             .expect("phantom edit must be rejected");
         assert!(
-            err.contains("replay"),
-            "the lying diff is caught by replay reconciliation: {}",
+            err.contains("population audit") || err.contains("replay"),
+            "the lying diff is caught by lifecycle coupling or replay reconciliation: {}",
             err
         );
     }
