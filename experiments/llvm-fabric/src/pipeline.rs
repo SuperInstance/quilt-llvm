@@ -35,6 +35,7 @@ fn run_named(
     let mut h = History::new();
     let mut stages = vec![f.clone()];
     let mut cur = f.clone();
+    let mut prev = f.clone();
     for name in pipeline {
         let rec = match *name {
             "constfold" => {
@@ -54,8 +55,11 @@ fn run_named(
             }
             other => return Err(format!("unknown pass {}", other)),
         };
+        crate::conserve::population_audit(&prev, &cur, &rec)
+            .map_err(|e| format!("pipeline pass {}: population audit: {}", name, e))?;
         h.push_tick(rec, &cur);
         stages.push(cur.clone());
+        prev = cur.clone();
     }
     Ok((cur, h, stages))
 }
