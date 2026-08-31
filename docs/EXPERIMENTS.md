@@ -715,3 +715,199 @@ pipelines this will need it.
   `git log`; cargo test green before each (99/99 at HEAD).
 - Nothing deleted; the v0 sections of this file are the v0 record
   (N4 applies to docs too).
+
+## 9. M3/M4 — the ledger pass manager and DCE-as-decay
+
+**Commits:** `d321793` (M3 manager) → `7d3bae2` (M4 decay) → `7378df3`
+(hardening). Suite 99/99 before → **121/121 after** (12 manager tests,
+10 decay tests; the hardening round deepened manager coverage +3).
+Both milestones green against ARCHITECTURE §4's exit criteria, with the
+caveats in §9.4.
+
+### 9.1 What was built
+
+**M3 — the manager (`src/manager.rs`).** A driver where enforcement
+moves from pass authors to the machine. A pass is a pure function
+`fabric -> (fabric, diff)`; the manager mechanically rejects, before
+the tick lands, a pass that emits an unverifiable fabric, drops or
+conjures values without ledger entries (`conserve`), or records its
+diff under a name other than the scheduled one. Every outcome lands as
+a Weft entry — advance (edits > 0, derived, never asserted) or fixed
+point — via the already-proven `push_tick`. Post-run, in-manager: weft
+law, chain-vs-stages, pipeline-wide conservation, and bit-identical
+replay (including replay-from-mid-history, D5). Registered passes
+compose in any order (`run(f, &[...names])`); the CLI grew a
+`manager FILE [PASSES...]` verb.
+
+**M4 — DCE as decay (`src/decay.rs`).** The load-bearing inversion: a
+value dies ONLY when its death ledger entry is a machine-checkable
+certificate naming **killer pass + tick + witness** — rendered form
+`death{killer=dce-decay tick=3 users=0 witness=no-demand}`. The
+verifier (`verify_deaths`) recomputes the witness from the pre-tick
+fabric: the cell was present, had exactly the claimed user count, and
+had no demand path to a terminator. A bogus kill is REJECTED naming
+the demand chain. Bare prose (`"dead: no path to a terminator"` — the
+old `dce` ledger style) no longer passes as a decay death. The tick in
+a certificate comes from the manager's `TickCtx`, not the pass's
+guess; a mismatch between the two is itself a rejection cause.
+
+Honesty first: the **liveness criterion is still reachability**, not
+the Hebbian use-count aging of ARCHITECTURE §1.4. What M4 delivers is
+the certificate/verifier machinery — the death-contract inversion —
+with reachability as the one v0 witness kind. Aging-based witnesses
+are v2 debt (§9.5).
+
+### 9.2 Numbers (release build, WSL2, rustc 1.97.1, 24 cores)
+
+Corpus (unchanged generator, `./llvm-fabric fuzz --iters 10000`):
+10,000/10,000 valid, 15,333 phis, 255,446 provenance-walked cells,
+0 roundtrip / prov / ctrl / weft / replay failures.
+
+Decay curves (`./llvm-fabric decay-curve --iters 10000`, seed
+0xD3CA5, pipeline `constfold → dce-decay → constfold → dce-decay`,
+1.1 s wall for the whole 10k):
+
+```
+fabrics: 10000   cells in: 255198   cells out: 70765   bogus deaths: 0
+stage after        mean cells  dead    cold    warm   (per fabric)
+    0 <input>          25.52  17.02   2.09   6.41
+    1 constfold        25.52  18.44   0.00   7.08
+    2 dce-decay         7.08   0.00   0.00   7.08
+    3 constfold         7.08   0.00   0.00   7.08
+    4 dce-decay         7.08   0.00   0.00   7.08
+deaths per tick: 50296[constfold] 184433[dce-decay] 0[constfold] 0[dce-decay]
+decay kills (certified): 184433 / deaths total: 234729
+ledger: 23510335 bytes total, mean 2351.0 B/fabric; weft entries: 40000
+```
+
+Readings, undersold: 66.7% of generated fabric is dead on arrival
+(the generator overproduces dead cells — a fuzz artifact, not a claim
+about real programs); constfold converts the 2.09 cold cells/fabric
+into dead (fold consumes them; their removals are ledgered as
+"folded into" — consumed-with-derivation, not decay kills); the first
+dce-decay sweep removes every dead cell (18.44/fabric mean) and the
+rest of the pipeline is a measured fixed point (0 deaths at ticks
+3–4 across all 10k fabrics). Deaths reconcile exactly: 50,296
+transform-consumed + 184,433 certified decay kills = 234,729 total;
+0 deaths anywhere in the run lacked a certificate that verified
+(`bogus deaths: 0`). Ledger overhead: 2,351 B/fabric mean (~92 B per
+cell-tick of paperwork; compaction is §9.5).
+
+### 9.3 The tamper-rejection proof (M4 exit criterion)
+
+`cargo run --release --example bogus_kill` — a forged certificate for
+a LIVE cell, with a correct user count, handed to the verifier:
+
+```
+forged ledger entry: death{killer=dce-decay tick=0 users=1 witness=no-demand}
+verifier says: death rejected: bogus kill of %1 — the cell is LIVE; demand chain %1 -> %2 -> %3 holds it
+REJECTED (exit 0)
+```
+
+The same rejection fires, with distinct messages, for a wrong user
+count ("claims 5 users but the pre-tick fabric has 0"), a wrong tick
+("names tick 9 but the diff lands at epoch 2"), a wrong killer
+("names killer 'other-pass' but the diff records 'dce-decay'"), and
+bare prose ("without a certificate"). All five are red/green tests in
+`decay.rs`.
+
+### 9.4 Failures, findings, surprises (first-class)
+
+1. **The manager's law order is observable.** Our first leaky-pass
+   fixture dropped a USED cell; `verify` (V01 dangling operand)
+   rejected it before conservation could, so the conservation test
+   failed its own intent. Fixed by dropping an unreferenced const.
+   Manager order is verify → conserve → land; both are mechanical,
+   and a test must target the law it claims to test.
+2. **Rust pedantry cost 20 minutes**: `BTreeMap::get_key_value`
+   inference picked the `Borrow<&'static str>` candidate and demanded
+   the pipeline slice outlive `'static`. Fix: the audit carries
+   `rec.pass` (the pass's own declaration, already proven equal to the
+   scheduled name). Zero semantics changed.
+3. **The corpus is dead-heavy** (66.7% dead on arrival). Decay curves
+   on it measure the machinery, not realistic programs. Booked.
+4. **Cold/warm classification is post-hoc** — "cold at stage k" uses
+   the final fabric to know what dies later. It is an autopsy, not a
+   prediction; labeled as such in the code. A predictive demand
+   analysis is v2.
+5. **Two drop classes coexist and both conserve**: constfold's
+   "folded into" (consumed-with-derivation) and dce-decay's death
+   certificates. Only the latter is bound to `verify_deaths`; the
+   former is bound to `conserve`. This is the three-way law (delivered
+   / consumed / dropped-with-entry) showing up in the numbers.
+6. **The whole corpus converges in 2 ticks** — the pipeline's second
+   fold/decay pair is always a fixed point on generated fabrics. A
+   cheaper steady-state detector (stop-on-idle) would halve the tick
+   count without losing any ledger guarantee; booked.
+7. **Ledger size dwarfs the fabric** (2.4 KB mean vs ~25 cells).
+   Known problem, now with a number attached to this pipeline shape.
+
+### 9.5 What v2 should change (M3/M4 additions to the v1 list)
+
+1. **Aging-based witnesses** — implement ARCHITECTURE §1.4's
+   use-count aging as a second witness kind; the certificate/verifier
+   shape is ready for multi-kind witnesses.
+2. **Predictive cold/warm** — pre-mortem liveness instead of autopsy.
+3. **Stop-on-idle scheduling** — measured: ticks 3–4 are always fixed
+   points on the corpus.
+4. **Ledger compaction with certificates intact** (the
+   REVERSE-ACTUALIZATION amputation problem, now priced at ~92 B per
+   cell-tick on this corpus).
+5. **Region-level decay** — unreachable regions still shield their
+   terminators (v1 debt, unchanged).
+6. **Cross-run tamper evidence** — the chain is recomputed in-run;
+   binding it to the on-disk fabric file (QUF-shaped format) is the
+   next step toward audit-without-replay. FNV-1a remains
+   non-cryptographic (sign.rs caveat, unchanged).
+
+### 9.6 Ledger (M3/M4)
+
+- Commits `d321793` (manager), `7d3bae2` (decay), `7378df3`
+  (verification-lane hardening), reachable in `git log`; cargo test
+  green before each (99 → 108 → 118 → 121). Nothing deleted; §8 and
+  earlier sections are the prior record.
+- The independent verification pass over both commits is booked in
+  §9.7, including its one wrong claim and the red test that corrected
+  it.
+
+## 9.7 Independent verification lane (Claude Code, Sonnet 5)
+
+`claude -p` review of `manager.rs` + `decay.rs`, run in tmux session
+`llvm-m34` after both commits, plus a confirmation round after the
+hardening commit `7378df3` (transcript `/tmp/llvm-m34-verify.out`,
+ephemeral; findings below are the durable record).
+
+**Round 1 verdict (code inspection): no bypasses found.** Solid: name
+matching, verify-on-output, post-run replay, strict certificate
+parsing, killer/tick/users re-verification, bogus-kill rejection,
+fixed-point ledgering, user-count re-measurement. Concrete findings,
+all closed in `7378df3`:
+
+- replay-from-mid-history tested one prefix (k=2) → now every boundary;
+- no overlapping-diff test → double `RemoveCell` for one id now proven
+  rejected (by replay reconciliation);
+- `register` shadowing undocumented → now last-wins, and a shadowing
+  pass must record under the registered name or the laundering check
+  fires (the test's first form failed as designed and proved it).
+
+**The lane was also wrong once, and the correction is load-bearing:**
+it claimed `conserve::check` catches a phantom removal (diff lists a
+removal the fabric did not perform). It does not — conserve checks
+vanished/appeared cells against the edit lists, not listed-vs-performed;
+the phantom passes conserve and is caught by post-run **replay**
+(`manager_rejects_a_phantom_edit_via_replay_reconciliation`). Red test
+added; the lane accepted the correction in round 2. Verification lanes
+are fallible; that is why their findings are red tests, not prose.
+
+**Round 2 final verdict (quoted, condensed):** "M3 and M4 prove the
+defense-in-depth mechanically… No bypass found in manager or decay
+logic itself, but the whole system sits atop three unverified
+substrates: `verify()` correctness, `conserve()` sufficiency for its
+layer, and `live_closure` completeness (is_terminator + operands
+encoding all live dependencies)." The three substrates are the repo's
+own tested layers (`verify.rs` 30+ mutant tests, `conserve.rs` suite,
+ctrl-wire coverage in §8) — delegation, not absence — except the third,
+which maps exactly to the booked region-decay debt (unreachable
+regions shield their terminators; §9.5 item 5). Suite count the lane
+reported from inspection (12+10 in the new files); the D7 re-run
+command and count: `cargo test --release` → **121 passed, 0 failed**.
