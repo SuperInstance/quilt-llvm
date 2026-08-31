@@ -15,6 +15,7 @@ fn main() {
         "verify" => cmd_verify(&args[2..]),
         "fuzz" => cmd_fuzz(&args[2..]),
         "pipeline" => cmd_pipeline(&args[2..]),
+        "manager" => cmd_manager(&args[2..]),
         "prov" => cmd_prov(&args[2..]),
         "replay" => cmd_replay(&args[2..]),
         "inline" => cmd_inline(&args[2..]),
@@ -23,7 +24,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: llvm-fabric <version|print FILE|verify FILE|fuzz [--iters N] [--seed S]|pipeline FILE|prov FILE CELL|replay FILE|bench>"
+                "usage: llvm-fabric <version|print FILE|verify FILE|fuzz [--iters N] [--seed S]|pipeline FILE|prov FILE CELL|replay FILE|manager FILE [PASSES...]|decay-curve [--iters N]|bench>"
             );
             exit(2);
         }
@@ -153,6 +154,42 @@ fn cmd_pipeline(args: &[String]) {
         }
         Err(e) => {
             eprintln!("pipeline failed: {}", e);
+            exit(1);
+        }
+    }
+}
+
+fn cmd_manager(args: &[String]) {
+    // M3: run a pipeline through the ledger pass manager — every tick
+    // reconciled (verify + conservation) before it lands, weft complete,
+    // replay bit-identical. Optional args: pass names (default v0 pipeline).
+    let f = load(args.first().expect("manager needs FILE"));
+    if let Err(e) = llvm_fabric::verify::verify(&f) {
+        eprintln!("input does not verify: {}", e);
+        exit(1);
+    }
+    let names: Vec<&str> = if args.len() > 1 {
+        args[1..].iter().map(|s| s.as_str()).collect()
+    } else {
+        llvm_fabric::pipeline::PIPELINE.to_vec()
+    };
+    let m = llvm_fabric::manager::PassManager::new();
+    match m.run(&f, &names, &std::collections::BTreeMap::new()) {
+        Ok(run) => {
+            println!("== manager audit (every tick reconciled before landing) ==");
+            print!("{}", run.audit_summary());
+            println!("== weft ==");
+            for t in &run.history.weft {
+                println!("  tick {} {} sig={:016x} chain={:016x} :: {}", t.epoch, t.pass, t.sig, t.chain, t.note);
+            }
+            println!(
+                "post-run: weft law ok, chain ok, conservation ok, replay bit-identical"
+            );
+            println!("== final fabric ==");
+            print!("{}", llvm_fabric::text::print(&run.fabric));
+        }
+        Err(e) => {
+            eprintln!("manager rejected the run: {}", e);
             exit(1);
         }
     }
