@@ -21,6 +21,7 @@ pub mod prov;
 pub mod ctrl;
 pub mod program;
 pub mod sign;
+pub mod weftmesh;
 pub mod pipeline;
 pub mod manager;
 pub mod decay;
