@@ -1,0 +1,76 @@
+   Compiling batten-spike v0.1.0 (/home/eileen/projects/quilt-llvm/experiments/batten-spike)
+warning: field `fog_scale` is never read
+  --> src/route.rs:38:5
+   |
+35 | struct SplineSet {
+   |        --------- field in this struct
+...
+38 |     fog_scale: f64,
+   |     ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `batten-spike` (bin "batten-spike") generated 1 warning
+    Finished `release` profile [optimized] target(s) in 0.97s
+     Running `target/release/batten-spike`
+batten-spike: verified-outcome routing over a toy pass pipeline
+pipelines: ["none", "fold", "fold>dce", "dce>fold", "full"]
+lambda (utility/cost tradeoff): 0.05
+
+=== fog_scale = 0.25 ===
+train battens: 800 fabrics x 5 pipelines = 4000 verified outcomes
+test fabrics: 200
+routing accuracy vs oracle: 123/200 = 61.5%
+mean score regret (oracle - routed): 0.01763
+cost: routed 9827 cells vs full 13310 cells -> 26.2% saved (vs always-full)
+cost vs oracle: routed 9827, oracle-cheapest 8595 (14.3% overhead)
+utility: routed mean 0.7081 vs oracle mean 0.7155
+fog at correct routes: mean 0.323 (n=123) | fog at misroutes: mean 0.305 (n=77)
+misroute histogram (routed -> oracle):
+  fold>dce -> dce>fold : 66
+  dce>fold -> fold>dce : 11
+oracle pick distribution: {"dce>fold": 108, "fold>dce": 92}
+trivial baseline (always "dce>fold", train majority): 53/200 = 26.5%
+
+=== fog_scale = 0.50 ===
+train battens: 800 fabrics x 5 pipelines = 4000 verified outcomes
+test fabrics: 200
+routing accuracy vs oracle: 113/200 = 56.5%
+mean score regret (oracle - routed): 0.01504
+cost: routed 10208 cells vs full 13310 cells -> 23.3% saved (vs always-full)
+cost vs oracle: routed 10208, oracle-cheapest 8595 (18.8% overhead)
+utility: routed mean 0.7155 vs oracle mean 0.7155
+fog at correct routes: mean 0.308 (n=113) | fog at misroutes: mean 0.327 (n=87)
+misroute histogram (routed -> oracle):
+  fold>dce -> dce>fold : 86
+  dce>fold -> fold>dce : 1
+oracle pick distribution: {"dce>fold": 108, "fold>dce": 92}
+trivial baseline (always "dce>fold", train majority): 23/200 = 11.5%
+
+=== fog_scale = 1.00 ===
+train battens: 800 fabrics x 5 pipelines = 4000 verified outcomes
+test fabrics: 200
+routing accuracy vs oracle: 104/200 = 52.0%
+mean score regret (oracle - routed): 0.01665
+cost: routed 10341 cells vs full 13310 cells -> 22.3% saved (vs always-full)
+cost vs oracle: routed 10341, oracle-cheapest 8595 (20.3% overhead)
+utility: routed mean 0.7159 vs oracle mean 0.7155
+fog at correct routes: mean 0.305 (n=104) | fog at misroutes: mean 0.328 (n=96)
+misroute histogram (routed -> oracle):
+  fold>dce -> dce>fold : 96
+oracle pick distribution: {"dce>fold": 108, "fold>dce": 92}
+trivial baseline (always "dce>fold", train majority): 12/200 = 6.0%
+
+=== fog_scale = 2.00 ===
+train battens: 800 fabrics x 5 pipelines = 4000 verified outcomes
+test fabrics: 200
+routing accuracy vs oracle: 92/200 = 46.0%
+mean score regret (oracle - routed): 0.01883
+cost: routed 10414 cells vs full 13310 cells -> 21.8% saved (vs always-full)
+cost vs oracle: routed 10414, oracle-cheapest 8595 (21.2% overhead)
+utility: routed mean 0.7159 vs oracle mean 0.7155
+fog at correct routes: mean 0.263 (n=92) | fog at misroutes: mean 0.362 (n=108)
+misroute histogram (routed -> oracle):
+  fold>dce -> dce>fold : 108
+oracle pick distribution: {"dce>fold": 108, "fold>dce": 92}
+trivial baseline (always "dce>fold", train majority): 0/200 = 0.0%

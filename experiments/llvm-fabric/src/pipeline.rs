@@ -5,16 +5,37 @@
 
 use crate::diff::History;
 use crate::fabric::Fabric;
+use std::collections::BTreeMap;
 
 pub const PIPELINE: &[&str] = &["constfold", "dce", "constfold", "dce"];
+
+/// v1 pipeline: the third pass (inline) slots between dce and the second
+/// fold/dce pair, per the scout build order (largest diffs ship last).
+pub const PIPELINE_V1: &[&str] = &["constfold", "dce", "inline", "constfold", "dce"];
 
 /// Run the pipeline. Returns (final, history, stages) where stages[0] is
 /// the input and stages[i] is the fabric after the i-th pass.
 pub fn run(f: &Fabric) -> Result<(Fabric, History, Vec<Fabric>), String> {
+    run_named(f, PIPELINE, &BTreeMap::new())
+}
+
+/// Run the v1 pipeline over a program's main fabric with its callees.
+pub fn run_v1(
+    f: &Fabric,
+    funcs: &BTreeMap<String, Fabric>,
+) -> Result<(Fabric, History, Vec<Fabric>), String> {
+    run_named(f, PIPELINE_V1, funcs)
+}
+
+fn run_named(
+    f: &Fabric,
+    pipeline: &[&str],
+    funcs: &BTreeMap<String, Fabric>,
+) -> Result<(Fabric, History, Vec<Fabric>), String> {
     let mut h = History::new();
     let mut stages = vec![f.clone()];
     let mut cur = f.clone();
-    for name in PIPELINE {
+    for name in pipeline {
         let rec = match *name {
             "constfold" => {
                 let (next, rec) = crate::passes::constfold::const_fold(&cur)?;
@@ -23,6 +44,11 @@ pub fn run(f: &Fabric) -> Result<(Fabric, History, Vec<Fabric>), String> {
             }
             "dce" => {
                 let (next, rec) = crate::passes::dce::dce(&cur)?;
+                cur = next;
+                rec
+            }
+            "inline" => {
+                let (next, rec) = crate::passes::inline::inline_calls(&cur, funcs)?;
                 cur = next;
                 rec
             }
@@ -101,5 +127,71 @@ mod tests {
         }
         assert_eq!(final_f, final_r);
         assert_eq!(crate::text::print(&final_f), crate::text::print(&final_r));
+    }
+}
+
+#[cfg(test)]
+mod v1_tests {
+    use super::*;
+    use crate::cell::CellKind;
+    use crate::conserve;
+    use crate::id::CellId;
+    use crate::replay;
+    use crate::verify::verify;
+    use std::collections::BTreeMap;
+
+    fn prog() -> (Fabric, BTreeMap<String, Fabric>) {
+        let main_text = "fabric v0\n\
+region entry\n\
+  %0 = param i32\n\
+  %1 = const i32 20\n\
+  %2 = const i32 22\n\
+  %3 = const i64 9i64\n\
+  %4 = call i32 add2 %1, %2\n\
+  %5 = ret %4\n";
+        let callee_text = "fabric v0\n\
+region entry\n\
+  %0 = param i32\n\
+  %1 = param i32\n\
+  %2 = arith.add i32 %0, %1\n\
+  %3 = ret %2\n";
+        let mut funcs = BTreeMap::new();
+        funcs.insert("add2".to_string(), crate::text::parse(callee_text).unwrap());
+        (crate::text::parse(main_text).unwrap(), funcs)
+    }
+
+    #[test]
+    fn v1_pipeline_folds_through_the_inline_boundary() {
+        let (f, funcs) = prog();
+        let (final_f, history, stages) = run_v1(&f, &funcs).unwrap();
+        assert_eq!(stages.len(), 6, "5 passes = 6 stages");
+        assert!(verify(&final_f).is_ok());
+        assert!(conserve::check_pipeline(&f, &final_f, &history).is_ok());
+        // the dead i64 const is DCE'd; the call is inlined; 20+22 folds
+        // THROUGH the graft: ret is fed by const 42
+        assert!(final_f.cell(CellId(4)).is_none(), "call gone");
+        assert!(final_f.cell(CellId(3)).is_none(), "dead const gone");
+        let fed = final_f.cell(CellId(5)).unwrap().operands[0];
+        assert_eq!(
+            final_f.cell(fed).unwrap().kind,
+            CellKind::Const { ty: crate::ty::Type::I32, val: crate::ty::ConstVal::I32(42) },
+            "fold crossed the inline boundary"
+        );
+        // replay still reproduces every stage bit-identically
+        let (replayed, final_r) = replay::replay(&f, &history).unwrap();
+        assert_eq!(replayed.len(), stages.len());
+        for (i, (a, b)) in stages.iter().zip(replayed.iter()).enumerate() {
+            assert_eq!(a, b, "stage {}", i);
+            assert_eq!(crate::text::print(a), crate::text::print(b), "stage {} text", i);
+        }
+        assert_eq!(final_f, final_r);
+        // the inline epoch is in the history with its ledger entry
+        let inline_rec = history
+            .records
+            .iter()
+            .find(|r| r.pass == "inline")
+            .expect("inline epoch recorded");
+        assert!(inline_rec.edits.iter().any(|e| matches!(e,
+            crate::diff::Edit::RemoveCell { ledger, .. } if ledger.contains("inlined 'add2'"))));
     }
 }

@@ -5,3 +5,4 @@
 
 pub mod constfold;
 pub mod dce;
+pub mod inline;

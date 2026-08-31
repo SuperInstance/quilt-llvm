@@ -1,0 +1,18 @@
+[package]
+name = "batten-spike"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "batten-spike"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned vendored snapshot of llvm-fabric @ quilt-llvm commit 2e5469e
+# (clean, tests green). The live experiments/llvm-fabric working tree had
+# uncommitted WIP at spike time and did not compile; this pin keeps the
+# experiment reproducible regardless of that lane's in-flight state.
+llvm-fabric = { path = "_dep/llvm-fabric-vendor" }
+
+[profile.release]
+debug = false

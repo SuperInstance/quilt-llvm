@@ -17,6 +17,7 @@ fn main() {
         "pipeline" => cmd_pipeline(&args[2..]),
         "prov" => cmd_prov(&args[2..]),
         "replay" => cmd_replay(&args[2..]),
+        "inline" => cmd_inline(&args[2..]),
         "bench" => {
             println!("{}", llvm_fabric::bench::bench());
         }
@@ -135,6 +136,88 @@ fn cmd_pipeline(args: &[String]) {
                 Err(e) => {
                     println!("conservation: VIOLATED — {}", e);
                     exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("pipeline failed: {}", e);
+            exit(1);
+        }
+    }
+}
+
+fn cmd_inline(args: &[String]) {
+    let path = args.first().expect("inline needs FILE (a fabric v1 program)");
+    let text = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("cannot read {}: {}", path, e);
+        exit(1);
+    });
+    let prog = match llvm_fabric::program::parse(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("program parse error: {}", e);
+            exit(1);
+        }
+    };
+    if let Err(e) = llvm_fabric::program::verify_program(&prog) {
+        eprintln!("program does not verify: {}", e);
+        exit(1);
+    }
+    let main = prog.get("main").expect("program needs a 'main'").clone();
+    let mut funcs = std::collections::BTreeMap::new();
+    for name in &prog.order {
+        if name != "main" {
+            funcs.insert(name.clone(), prog.get(name).unwrap().clone());
+        }
+    }
+    // remember what fed ret BEFORE, for the payoff shot
+    let call_ids: Vec<llvm_fabric::id::CellId> = main
+        .cells()
+        .filter(|&id| matches!(main.cell(id).map(|c| &c.kind), Some(llvm_fabric::cell::CellKind::Call { .. })))
+        .collect();
+    match llvm_fabric::pipeline::run_v1(&main, &funcs) {
+        Ok((final_f, history, _)) => {
+            println!("== history ==");
+            print!("{}", history.render(&final_f));
+            println!("== final main ==");
+            print!("{}", llvm_fabric::text::print(&final_f));
+            match llvm_fabric::verify::verify(&final_f) {
+                Ok(()) => println!("final verifies: yes"),
+                Err(e) => {
+                    println!("final verifies: NO — {}", e);
+                    exit(1);
+                }
+            }
+            match llvm_fabric::conserve::check_pipeline(&main, &final_f, &history) {
+                Ok(()) => println!("conservation: holds"),
+                Err(e) => {
+                    println!("conservation: VIOLATED — {}", e);
+                    exit(1);
+                }
+            }
+            // payoff shot: the value that WAS each call result, walked
+            // back through the graft into caller values
+            for cid in call_ids {
+                println!("== full provenance of the former call result {} (through the graft) ==", cid);
+                let ret_id = final_f
+                    .cells()
+                    .find(|&id| matches!(final_f.cell(id).map(|c| &c.kind), Some(llvm_fabric::cell::CellKind::Ret)))
+                    .unwrap();
+                let _ = ret_id;
+                let story = llvm_fabric::prov::prov_history(&history, cid);
+                for (epoch, pass, what) in story {
+                    println!("  tick {} {}: {}", epoch, pass, what);
+                }
+            }
+            let ret_id = final_f
+                .cells()
+                .find(|&id| matches!(final_f.cell(id).map(|c| &c.kind), Some(llvm_fabric::cell::CellKind::Ret)))
+                .unwrap();
+            if let Some(&fed) = final_f.cell(ret_id).unwrap().operands.first() {
+                println!("== provenance(ret) after inline ==");
+                match llvm_fabric::prov::provenance(&final_f, fed) {
+                    Ok(node) => print!("{}", llvm_fabric::prov::render(&node)),
+                    Err(e) => println!("  prov failed: {}", e),
                 }
             }
         }

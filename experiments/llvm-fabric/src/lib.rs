@@ -19,5 +19,6 @@ pub mod replay;
 pub mod passes;
 pub mod prov;
 pub mod ctrl;
+pub mod program;
 pub mod pipeline;
 pub mod bench;

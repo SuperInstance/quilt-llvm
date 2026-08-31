@@ -25,11 +25,16 @@ pub struct DiffRecord {
     pub pass: &'static str,
     pub epoch: u64,
     pub edits: Vec<Edit>,
+    /// Human-readable pass notes that are NOT machine-applicable edits —
+    /// e.g. why a candidate transform was skipped. A skip without a note
+    /// would be the "silent no-op" the scout report bans (TILE-CONTRACT
+    /// M3); notes make skips queryable.
+    pub notes: Vec<String>,
 }
 
 impl DiffRecord {
     pub fn new(pass: &'static str) -> DiffRecord {
-        DiffRecord { pass, epoch: 0, edits: vec![] }
+        DiffRecord { pass, epoch: 0, edits: vec![], notes: vec![] }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -38,6 +43,9 @@ impl DiffRecord {
 
     pub fn render(&self, f: &crate::fabric::Fabric) -> String {
         let mut out = format!("epoch {} pass {}\n", self.epoch, self.pass);
+        for n in &self.notes {
+            out.push_str(&format!("  # note: {}\n", n));
+        }
         for e in &self.edits {
             match e {
                 Edit::AddCell { id, index, cell } => {
@@ -104,6 +112,10 @@ fn render_standalone(f: &crate::fabric::Fabric, id: CellId, cell: &crate::cell::
             } else {
                 format!("{} = ret {}", id, o(0))
             }
+        }
+        CellKind::Call { name, ret_ty } => {
+            let args: Vec<String> = cell.operands.iter().map(|x| x.to_string()).collect();
+            format!("{} = call {} {} {}", id, ret_ty.name(), name, args.join(", "))
         }
     }
 }

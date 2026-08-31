@@ -79,6 +79,12 @@ pub enum CellKind {
     Phi { joins: Vec<crate::id::RegionId> },
     /// Return terminator. operands[0] is the returned value, if any.
     Ret,
+    /// Call to a named function (v1). operands are the arguments, in
+    /// order; `ret_ty` is the declared return type — every v1 call
+    /// produces exactly one value (void calls are out of scope, stated
+    /// in EXPERIMENTS.md). The callee is resolved by name at the
+    /// PROGRAM level (program.rs); a single fabric cannot check it.
+    Call { name: String, ret_ty: Type },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -101,6 +107,7 @@ impl Cell {
             CellKind::Jump { .. } => vec![],
             CellKind::Phi { joins } => vec![CellId(u32::MAX); joins.len()],
             CellKind::Ret => vec![],
+            CellKind::Call { .. } => vec![],
         };
         Cell { region, kind, operands }
     }
@@ -110,7 +117,8 @@ impl Cell {
         matches!(self.kind, CellKind::Branch { .. } | CellKind::Jump { .. } | CellKind::Ret)
     }
 
-    /// Produces a value other cells can use as an operand.
+    /// Produces a value other cells can use as an operand. Calls produce
+    /// their declared return type (v1: every call returns a value).
     pub fn produces_value(&self) -> bool {
         !self.is_terminator()
     }
@@ -128,6 +136,7 @@ impl Cell {
                 f.cell(*first).and_then(|c| c.ty_of(f))
             }
             CellKind::Branch { .. } | CellKind::Jump { .. } | CellKind::Ret => None,
+            CellKind::Call { ret_ty, .. } => Some(*ret_ty),
         }
     }
 }

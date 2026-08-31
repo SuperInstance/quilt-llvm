@@ -185,6 +185,10 @@ pub fn baseline_ssa(f: &Fabric) -> String {
                         format!("ret {}", o(0))
                     }
                 }
+                CellKind::Call { name, ret_ty } => {
+                    let args: Vec<String> = c.operands.iter().map(|x| format!("%{}", x.0)).collect();
+                    format!("{} = call {} @{}({})", id.0, ret_ty.name(), name, args.join(", "))
+                }
             };
             out.push_str("  ");
             out.push_str(&line);

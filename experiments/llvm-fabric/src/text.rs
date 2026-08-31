@@ -62,6 +62,10 @@ pub fn render_cell(f: &Fabric, id: CellId) -> String {
                 format!("{} = ret {}", id, o(0))
             }
         }
+        CellKind::Call { name, ret_ty } => {
+            let args: Vec<String> = c.operands.iter().map(|x| x.to_string()).collect();
+            format!("{} = call {} {} {}", id, ret_ty.name(), name, args.join(", "))
+        }
     }
 }
 
@@ -102,6 +106,11 @@ fn strip_comment(s: &str) -> &str {
         Some(i) => &s[..i],
         None => s,
     }
+}
+
+/// Public wrapper for the program parser (fn bodies are delegated here).
+pub fn strip_comment_pub(s: &str) -> &str {
+    strip_comment(s)
 }
 
 fn parse_cell_id(tok: &str) -> Option<CellId> {
@@ -303,6 +312,21 @@ fn parse_cell_line(
                 c.operands = vec![operand(rest[1])?];
             } else if rest.len() != 1 {
                 return Err(err(line, "ret takes zero or one operand"));
+            }
+            Ok(c)
+        }
+        "call" => {
+            // %N = call <retty> <name> <a>, <b>, ...  (commas are stripped
+            // by the tokenizer; args are rest[3..])
+            if rest.len() < 3 {
+                return Err(err(line, "call needs a return type and a callee name"));
+            }
+            let ret_ty = Type::parse(rest[1])
+                .ok_or_else(|| err(line, format!("bad call return type '{}'", rest[1])))?;
+            let name = rest[2].to_string();
+            let mut c = Cell::new(region, CellKind::Call { name, ret_ty });
+            for a in &rest[3..] {
+                c.operands.push(operand(a)?);
             }
             Ok(c)
         }

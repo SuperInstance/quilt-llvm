@@ -1,0 +1,23 @@
+; inlineme.v1fabric — a fabric v1 program for the inline lane.
+; Try:
+;   llvm-fabric inline examples/inlineme.v1fabric
+;
+; main calls add2(20, 22) and add2(<that>, param); the v1 pipeline
+; folds, DCEs, inlines, folds THROUGH the graft, and DCEs again.
+; The prov walk at the end crosses the inline boundary.
+fabric v1
+fn main
+region entry
+  %0 = param i32
+  %1 = const i32 20
+  %2 = const i32 22
+  %3 = const i64 9i64
+  %4 = call i32 add2 %1, %2
+  %5 = call i32 add2 %4, %0
+  %6 = ret %5
+fn add2
+region entry
+  %0 = param i32
+  %1 = param i32
+  %2 = arith.add i32 %0, %1
+  %3 = ret %2

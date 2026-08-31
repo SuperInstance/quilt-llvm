@@ -319,6 +319,21 @@ pub fn verify(f: &Fabric) -> Result<(), VerifyError> {
                 }
             }
             CellKind::Jump { .. } => {}
+            CellKind::Call { name, ret_ty } => {
+                // V18: call operands must be value cells (arity and types
+                // against the actual callee are checked at the PROGRAM
+                // level — a lone fabric cannot resolve the name).
+                for (slot, &op) in c.operands.iter().enumerate() {
+                    let op_cell = f.cell(op).expect("V01 checked");
+                    if !op_cell.produces_value() {
+                        return Err(fail(
+                            "V18",
+                            format!("call {} ({}) operand {} is not a value cell: {}", id, name, slot, op),
+                        ));
+                    }
+                }
+                let _ = ret_ty;
+            }
             CellKind::Ret => {
                 if let Some(&op) = c.operands.first() {
                     let op_cell = f.cell(op).expect("V01 checked");
