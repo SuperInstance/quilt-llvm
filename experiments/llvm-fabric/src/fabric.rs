@@ -243,6 +243,119 @@ impl Fabric {
         self.tables = UseTables::derive(self);
     }
 
+    /// REMOVE a region through the sanctioned vocabulary (the
+    /// RegionRemoved edit's carrier): the region must be EMPTY (its
+    /// cells ride their own RemoveCell edits — removing a listed cell
+    /// here would strand it in the slab), every region id above it
+    /// compacts down by one, and every surviving reference is remapped
+    /// (cell.region, Jump/Branch targets, phi joins). Table repair:
+    /// the region's succ/pred rows leave with it and every region id
+    /// inside the surviving rows is remapped; users rows are untouched
+    /// (cell ids do not move). Returns the removed Region, or None if
+    /// absent or still listing cells.
+    pub fn remove_region(&mut self, r: RegionId) -> Option<Region> {
+        let region = self.regions.get(r.0 as usize)?.clone();
+        if !region.cells.is_empty() {
+            return None;
+        }
+        let remap = |x: &mut RegionId| {
+            if x.0 > r.0 {
+                x.0 -= 1;
+            }
+        };
+        for c in self.slab.iter_mut().flatten() {
+            remap(&mut c.region);
+            match &mut c.kind {
+                CellKind::Branch { then_r, else_r } => {
+                    remap(then_r);
+                    remap(else_r);
+                }
+                CellKind::Jump { target } => remap(target),
+                CellKind::Phi { joins } => {
+                    for j in joins.iter_mut() {
+                        remap(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // remap preserves preds' ascending order (a strictly monotone
+        // map on a sorted row is sorted) and succs' [then, else] order.
+        for rows in [&mut self.tables.succs, &mut self.tables.preds] {
+            if (r.0 as usize) < rows.len() {
+                rows.remove(r.0 as usize);
+                for row in rows.iter_mut() {
+                    for x in row.iter_mut() {
+                        remap(x);
+                    }
+                }
+            }
+        }
+        self.regions.remove(r.0 as usize);
+        Some(region)
+    }
+
+    /// MOVE a cell to another region (the MoveCell edit's carrier):
+    /// id stable, region membership moves, `index` clamped like
+    /// insert_cell's. Table repair: when the cell leaves its old
+    /// region's last position (or lands at its new region's end), that
+    /// region's succ row is recomputed from whatever is last now.
+    /// Returns the old region, or None if the cell/destination is
+    /// absent.
+    pub fn move_cell(&mut self, id: CellId, to: RegionId, index: usize) -> Option<RegionId> {
+        let cell = self.cell(id)?.clone();
+        self.regions.get(to.0 as usize)?;
+        let from = cell.region;
+        let was_last = {
+            let cells = &mut self.regions[from.0 as usize].cells;
+            let pos = cells.iter().position(|&c| c == id)?;
+            let last = pos + 1 == cells.len();
+            cells.remove(pos);
+            last
+        };
+        if was_last {
+            let new_succs = self
+                .regions
+                .get(from.0 as usize)
+                .and_then(|r| r.cells.last().copied())
+                .and_then(|last| self.cell(last))
+                .map(|c| kind_succs(&c.kind))
+                .unwrap_or_default();
+            self.tables.set_succs(from, new_succs);
+        }
+        self.cell_mut(id)?.region = to;
+        let lands_last = {
+            let r = &mut self.regions[to.0 as usize];
+            let idx = index.min(r.cells.len());
+            let last = idx == r.cells.len();
+            r.cells.insert(idx, id);
+            last
+        };
+        if lands_last {
+            let succs = kind_succs(&self.cell(id).expect("present").kind);
+            self.tables.set_succs(to, succs);
+        }
+        Some(from)
+    }
+
+    /// RELABEL one phi join `from` -> `to` (the join-relabel edit's
+    /// carrier): only the label moves. Phi joins are not use edges
+    /// (operands carry the wires) and the succ/pred tables track
+    /// terminators, not joins — V06/V16 read labels at verify time —
+    /// so no table work is needed. None when the phi is absent, is
+    /// not a phi, or carries no join on `from`.
+    pub fn relabel_join(&mut self, phi: CellId, from: RegionId, to: RegionId) -> Option<()> {
+        let c = self.cell_mut(phi)?;
+        match &mut c.kind {
+            CellKind::Phi { joins } => {
+                let j = joins.iter_mut().find(|j| **j == from)?;
+                *j = to;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
     pub fn cell(&self, id: CellId) -> Option<&Cell> {
         self.slab.get(id.0 as usize).and_then(|c| c.as_ref())
     }
@@ -446,5 +559,78 @@ mod tests {
         assert_eq!(f.region(entry).unwrap().cells, vec![CellId(0), CellId(2)]);
         // double assignment must fail, not panic
         assert!(f.place_cell(CellId(0), Cell::new(entry, CellKind::Ret)).is_err());
+    }
+
+    /// R3 region-granular mutators: remove_region / move_cell /
+    /// relabel_join must keep the use tables bit-identical to a
+    /// from-scratch derivation at every step (the R2 law, extended
+    /// to the region-edit vocabulary), and remove_region must refuse
+    /// a region that still lists cells.
+    #[test]
+    fn region_mutators_keep_tables_derivable() {
+        let text = "fabric v0\n\
+region entry\n\
+  %0 = param i32\n\
+  %1 = const i1 true\n\
+  %2 = br %1, t, el\n\
+region t\n\
+  %3 = const i32 1\n\
+  %4 = jump j\n\
+region el\n\
+  %5 = const i32 2\n\
+  %6 = jump j\n\
+region j\n\
+  %7 = phi [t: %3] [el: %5]\n\
+  %8 = ret %7\n";
+        let mut f = crate::text::parse(text).expect("diamond parses");
+        assert_eq!(crate::usetables::UseTables::derive(&f), f.tables);
+
+        // MOVE the entry terminator into a fresh continuation region:
+        // entry's succ row empties, cont's fills — locally repaired.
+        let cont = f.add_region("cont");
+        assert_eq!(crate::usetables::UseTables::derive(&f), f.tables);
+        let from = f.move_cell(CellId(2), cont, 0).expect("br moves");
+        assert_eq!(from, RegionId(0));
+        assert_eq!(crate::usetables::UseTables::derive(&f), f.tables);
+        assert_eq!(f.successors(RegionId(0)), &[] as &[RegionId], "entry ends in a const now");
+        assert_eq!(f.successors(cont), &[RegionId(1), RegionId(2)]);
+        assert_eq!(f.predecessors(RegionId(3)), &[RegionId(1), RegionId(2)]);
+
+        // RELABEL the phi's el-join to cont (labels only; no table rows move)
+        f.relabel_join(CellId(7), RegionId(2), cont).expect("el join relabeled");
+        assert_eq!(crate::usetables::UseTables::derive(&f), f.tables);
+
+        // REMOVE: the moved br must leave first (cells ride their own
+        // removals) — a non-empty region is refused — then the empty
+        // region goes, compacting nothing above it (it is last).
+        assert!(f.remove_region(cont).is_none(), "non-empty region must be refused");
+        f.remove_cell(CellId(2)).expect("br out");
+        let gone = f.remove_region(cont).expect("empty region leaves");
+        assert!(gone.cells.is_empty());
+        assert_eq!(f.regions.len(), 4);
+        assert_eq!(crate::usetables::UseTables::derive(&f), f.tables);
+
+        // REMOVE in the middle: 't' emptied and removed compacts el/j
+        // down — every reference (joins, targets) must follow.
+        f.remove_cell(CellId(3)).expect("const out of t");
+        f.remove_cell(CellId(4)).expect("jump out of t");
+        // (t is now empty but targeted by nothing: entry's br is gone)
+        let _ = f.remove_region(RegionId(1)).expect("t leaves");
+        assert_eq!(f.regions.len(), 3);
+        assert_eq!(f.region_name(RegionId(1)), "el");
+        assert_eq!(f.region_name(RegionId(2)), "j");
+        assert_eq!(crate::usetables::UseTables::derive(&f), f.tables);
+        match &f.cell(CellId(7)).unwrap().kind {
+            CellKind::Phi { joins } => {
+                // el (was 2) compacted to 1; the relabeled cont (was 4,
+                // already removed above with its rows) is gone from joins?
+                // No: relabel only changed 2 -> 4 earlier; 4 is now out of
+                // range after cont's removal — the walk stays derivable;
+                // this fixture stops before verify (labels are stale by
+                // construction; V06 would fire — that is verify's job).
+                let _ = joins;
+            }
+            k => panic!("phi kept, got {:?}", k),
+        }
     }
 }

@@ -111,6 +111,13 @@ pub fn population_audit(
                     ));
                 }
             }
+            // Region-granular kinds are population-neutral by design:
+            // cells ride their own Add/RemoveCell edits (a RegionRemoved
+            // carrying cells is rejected by replay before any audit).
+            Edit::RegionAdded { .. }
+            | Edit::RegionRemoved { .. }
+            | Edit::MoveCell { .. }
+            | Edit::RelabelJoin { .. } => {}
         }
     }
     for id in &removed_ids {
@@ -141,14 +148,28 @@ pub fn population_audit(
     if !removed_ids.is_empty() {
         let mut ctx = before.clone();
         for e in &rec.edits {
-            if let Edit::Retarget { cell, slot, from, to } = e {
-                if let Some(c) = ctx.cell_mut(*cell) {
-                    if let Some(op) = c.operands.get_mut(*slot as usize) {
-                        if *op == *from {
-                            *op = *to;
+            match e {
+                Edit::Retarget { cell, slot, from, to } => {
+                    if let Some(c) = ctx.cell_mut(*cell) {
+                        if let Some(op) = c.operands.get_mut(*slot as usize) {
+                            if *op == *from {
+                                *op = *to;
+                            }
                         }
                     }
                 }
+                // region-granular edits shift region ids/names AFTER
+                // them; a summary rendered post-compaction only
+                // reproduces on a ctx that walked the same edits
+                Edit::RegionAdded { .. }
+                | Edit::RegionRemoved { .. }
+                | Edit::MoveCell { .. }
+                | Edit::RelabelJoin { .. } => {
+                    crate::replay::apply_edit(&mut ctx, e).map_err(|err| {
+                        format!("record is not self-consistent: {}", err)
+                    })?;
+                }
+                _ => {}
             }
         }
         for e in &rec.edits {
