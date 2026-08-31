@@ -911,3 +911,146 @@ which maps exactly to the booked region-decay debt (unreachable
 regions shield their terminators; §9.5 item 5). Suite count the lane
 reported from inspection (12+10 in the new files); the D7 re-run
 command and count: `cargo test --release` → **121 passed, 0 failed**.
+
+---
+
+# R1 LANE — the fold-table oracle (2026-08-30)
+
+First lane of the phase plan (docs/phase/NEXT-PHASE.md §3, R1 lane 1).
+Same rules: red/green, reachable hashes, measured numbers, cargo test
+green before commit. Suite: **121 → 125 tests**.
+
+## 10. The oracle — judging arithmetic against Rust
+
+### 10.1 Why (the hole, measured)
+
+Everything §1–§9 built judges the *machinery* around folding —
+verification, conservation, replay, death certificates. None of it
+judges the arithmetic. A sabotage battery run at `90d38b0` (method:
+`git archive` pin, one-line type-correct corruptions of the fold
+table, `cargo test`) measured the hole:
+
+```
+sabotage                          existing 121-test suite
+i32 add  -> x*y+1                 FAILED (5 tests)
+i64 add  -> x*y+1                 ok. 121 passed     <- escaped
+i32 sub  -> y-x  (swapped)        ok. 121 passed     <- escaped
+i32 mul  -> x+y                   ok. 121 passed     <- escaped
+i32 div  -> x*y                   FAILED (1 test)
+cmp i32 Lt -> <=                  ok. 121 passed     <- escaped
+cmp i64 Ge -> >                   ok. 121 passed     <- escaped
+```
+
+**5 of 7 corruptions survived the entire suite, the 10,000-fabric
+corpus included.** A compiler folding `2*3` to `5` was green. The
+corpus cannot see this by construction: its oracle set (verify,
+roundtrip, provenance termination, weft chain, replay bit-identity,
+conservation) is entirely structural — `src/fuzz.rs` never evaluates a
+program.
+
+Transform-level sabotages were, by contrast, already caught: reversing
+inline's caller-arg binding failed 1 test, and skipping an operand in
+decay's `live_closure` failed 6. The hole was the fold table
+specifically, not the transforms.
+
+### 10.2 What was built
+
+`src/passes/constfold.rs`, `mod oracle` + `mod oracle_tests` (~330
+lines incl. the battery). Deliberately **not a second fold table**:
+`eval_arith` / `eval_cmp` are compared against **Rust's own
+`checked_*` arithmetic and comparison operators** over a swept operand
+grid. The oracle is the language's semantics, not a restatement of
+ours.
+
+- **Grids.** i32/i64: 15 values each (0, ±1, ±2, ±3, 7, ±42, 1000,
+  MAX, MIN, MAX−1, MIN+1) swept pairwise per op. f64: 15 values
+  including `-0.0`, `inf`, `-inf`, MAX, MIN, EPSILON. i1: both values.
+  Plus mixed-width pairs, which must never fold.
+- **f64 equality is by bit pattern**, not `PartialEq`. `ty.rs` warns
+  that `0.0 == -0.0`; a fold that lost the sign of zero would slip past
+  a `==` oracle. This closes the booked float-equality caveat (§5.9)
+  for the fold table.
+- **NaN.** Not an input (unparseable by design, §5.8) — but NaN
+  *results* are reachable from representable inputs (`inf + -inf`,
+  `inf * 0`, `0/0`), and the oracle requires the fold to refuse them.
+- **i1 has no arithmetic and no ordering**; both are asserted refused.
+
+### 10.3 The battery as a red/green fixture (D1)
+
+The audit functions take the table under test as a parameter, so the
+oracle can be pointed at deliberately corrupted tables in-process.
+`the_seven_documented_sabotages_are_caught` reproduces exactly the
+seven corruptions of §10.1; `the_widened_f64_and_i1_legs_catch_their_
+own_sabotages` covers two more that only the new legs can see (a fold
+that keeps a NaN result; a cmp that invents an ordering for booleans).
+
+The fixture asserts each saboteur is caught **and caught on the right
+arm** — the reported disagreement must name the corrupted operation. A
+bare `is_err()` check would pass while the oracle was broken.
+
+**The RED step was real and is worth recording.** With the audit
+functions stubbed to `Ok(())`, the battery reported:
+
+```
+oracle is blind to 9 sabotage(s): ["i32 add -> x*y+1", "i64 add -> x*y+1",
+ "i32 sub -> y-x (swapped)", "i32 mul -> x+y", "i32 div -> x*y",
+ "f64 add keeps NaN", "cmp i32 Lt -> <=", "cmp i64 Ge -> >",
+ "cmp i1 invents ordering"]
+```
+
+— while both `..._matches_rust_...` tests passed **vacuously** against
+the same stub. That is the whole argument for the fixture in one
+output: without it, a blind oracle is indistinguishable from a working
+one.
+
+### 10.4 Numbers
+
+- Suite **121 → 125**, all green (`cargo test` → 125 passed, 0 failed).
+- Runtime: 0.22 s → 0.23 s. The grids are ~9k comparisons; cost is
+  not measurable against the existing suite.
+- **End-to-end confirmation** (source-level corruption, not the
+  in-process saboteur models — the models could differ from real
+  edits): all five previously-escaping sabotages now fail the suite.
+
+```
+source-level sabotage vs the landed oracle
+i64 add -> x*y+1        FAILED. 123 passed
+i32 sub -> y-x          FAILED. 123 passed
+i32 mul -> x+y          FAILED. 123 passed
+cmp i32 Lt -> <=        FAILED. 123 passed
+cmp i64 Ge -> >         FAILED. 124 passed
+```
+
+7/7 of the documented battery is now caught, up from 2/7.
+
+### 10.5 Failures, findings, surprises (first-class)
+
+1. **The f64 leg is weaker evidence than the integer legs, and says
+   so in the code.** `checked_add` is a genuinely independent
+   implementation; the NaN-refusal rule is a *policy* the oracle
+   restates rather than derives. The integer legs are a real
+   cross-check; the f64 leg is closer to a regression pin. Labeled at
+   the definition of `expect_f64`.
+2. **This oracle covers the fold table and nothing else.** phi
+   selection, control flow, and pass composition remain unjudged —
+   not because the implementation is untested but because **no
+   execution semantics exists to test**. You cannot mutation-test code
+   that does not exist. That is what M2 would buy; it stays gated
+   (NEXT-PHASE.md §4, T2).
+3. **The repo has no CI workflow.** `.github/workflows` does not
+   exist; `cargo test` is the actual gate, and that is where this
+   fixture runs. D1's enforcement note assumes a CI that isn't wired.
+   Booked, not invented — standing up CI is Casey's call, not this
+   lane's.
+4. **Round-1 strategy overstated the hole.** It implied the transforms
+   were as exposed as the fold table; measurement showed they were
+   already covered (inline by exactly 1 test — thin, but covered). The
+   correction is recorded in NEXT-PHASE.md §2.
+
+### 10.6 Ledger
+
+- One commit, this lane; `cargo test` green before it (125/125).
+- Nothing deleted. §1–§9 stand as the prior record (N4).
+- Measurements run against `git archive` pins, not the live tree —
+  concurrent lanes have twice broken the live tree mid-measurement
+  (NEXT-PHASE.md §7c).

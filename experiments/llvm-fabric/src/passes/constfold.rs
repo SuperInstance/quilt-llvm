@@ -345,3 +345,394 @@ mod tests {
         );
     }
 }
+
+/// The fold-table oracle (NEXT-PHASE.md R1 lane 1).
+///
+/// The pass suite proves the *machinery* around folding — conservation,
+/// replay, death certificates. It does not judge the arithmetic itself:
+/// a sabotage battery measured at `90d38b0` showed **5 of 7** one-line
+/// fold-table corruptions surviving the entire 121-test suite, the
+/// 10,000-fabric corpus included (docs/phase/NEXT-PHASE.md §2).
+///
+/// This module supplies the missing judge. It is deliberately NOT a
+/// second fold table: it compares `eval_arith` / `eval_cmp` against
+/// **Rust's own checked arithmetic and comparison operators** over a
+/// swept operand grid. The oracle is the language's semantics, not a
+/// restatement of ours.
+///
+/// The audit functions take the table under test as a parameter so the
+/// oracle can be pointed at deliberately corrupted tables. That is what
+/// `the_seven_sabotage_battery_is_caught` does: it is the D1 red/green
+/// proof that this oracle detects what it claims to detect.
+#[cfg(test)]
+mod oracle {
+    use super::*;
+    use crate::ty::ConstVal::{self, *};
+
+    pub type ArithFn = fn(ArithOp, ConstVal, ConstVal) -> Option<ConstVal>;
+    pub type CmpFn = fn(CmpOp, ConstVal, ConstVal) -> Option<ConstVal>;
+
+    /// Strict equality for expected-vs-actual fold results.
+    ///
+    /// f64 is compared by BIT PATTERN, not `PartialEq`. `ty.rs` warns
+    /// that `0.0 == -0.0` under `PartialEq`; a fold that lost the sign
+    /// of zero would slip past a `==` oracle. This closes the booked
+    /// float-equality caveat (EXPERIMENTS.md §5.9) for the fold table.
+    fn same(a: Option<ConstVal>, b: Option<ConstVal>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(F64(x)), Some(F64(y))) => x.to_bits() == y.to_bits(),
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    fn grid_i32() -> Vec<i32> {
+        vec![0, 1, -1, 2, -2, 3, -3, 7, 42, -42, 1000, i32::MAX, i32::MIN, i32::MAX - 1, i32::MIN + 1]
+    }
+    fn grid_i64() -> Vec<i64> {
+        vec![0, 1, -1, 2, -2, 3, -3, 7, 42, -42, 1000, i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1]
+    }
+    /// Every value here is representable in the text format. NaN is NOT
+    /// an input (unparseable by design, EXPERIMENTS.md §5.8) — but NaN
+    /// *results* are reachable from these inputs (inf + -inf, inf * 0,
+    /// 0/0) and the oracle requires the fold to refuse them.
+    fn grid_f64() -> Vec<f64> {
+        vec![
+            0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 2.0, -3.5, 1e308, -1e308,
+            f64::INFINITY, f64::NEG_INFINITY, f64::MAX, f64::MIN, f64::EPSILON,
+        ]
+    }
+    fn grid_i1() -> Vec<bool> {
+        vec![false, true]
+    }
+
+    /// The independent expectation for float folding: IEEE arithmetic,
+    /// except that a NaN result is refused (the format cannot print it).
+    /// Honest caveat: the NaN-refusal half restates a documented policy
+    /// rather than deriving it, so the f64 leg is weaker evidence than
+    /// the integer legs, where `checked_*` is a genuinely separate
+    /// implementation.
+    fn expect_f64(r: f64) -> Option<ConstVal> {
+        if r.is_nan() { None } else { Some(F64(r)) }
+    }
+
+    fn disagree(
+        op: &str,
+        a: ConstVal,
+        b: ConstVal,
+        got: Option<ConstVal>,
+        want: Option<ConstVal>,
+    ) -> String {
+        format!("{op} {a:?} {b:?}: table says {got:?}, Rust says {want:?}")
+    }
+
+    /// Judge an arith table against Rust. `Err` names the first
+    /// disagreement.
+    pub fn audit_arith(f: ArithFn) -> Result<(), String> {
+        let ops = [
+            (ArithOp::Add, "arith.add"),
+            (ArithOp::Sub, "arith.sub"),
+            (ArithOp::Mul, "arith.mul"),
+            (ArithOp::Div, "arith.div"),
+        ];
+        for (op, name) in ops {
+            for &x in &grid_i32() {
+                for &y in &grid_i32() {
+                    let want = match op {
+                        ArithOp::Add => x.checked_add(y),
+                        ArithOp::Sub => x.checked_sub(y),
+                        ArithOp::Mul => x.checked_mul(y),
+                        ArithOp::Div => x.checked_div(y),
+                    }
+                    .map(I32);
+                    let got = f(op, I32(x), I32(y));
+                    if !same(got, want) {
+                        return Err(disagree(name, I32(x), I32(y), got, want));
+                    }
+                }
+            }
+            for &x in &grid_i64() {
+                for &y in &grid_i64() {
+                    let want = match op {
+                        ArithOp::Add => x.checked_add(y),
+                        ArithOp::Sub => x.checked_sub(y),
+                        ArithOp::Mul => x.checked_mul(y),
+                        ArithOp::Div => x.checked_div(y),
+                    }
+                    .map(I64);
+                    let got = f(op, I64(x), I64(y));
+                    if !same(got, want) {
+                        return Err(disagree(name, I64(x), I64(y), got, want));
+                    }
+                }
+            }
+            for &x in &grid_f64() {
+                for &y in &grid_f64() {
+                    let want = expect_f64(match op {
+                        ArithOp::Add => x + y,
+                        ArithOp::Sub => x - y,
+                        ArithOp::Mul => x * y,
+                        ArithOp::Div => x / y,
+                    });
+                    let got = f(op, F64(x), F64(y));
+                    if !same(got, want) {
+                        return Err(disagree(name, F64(x), F64(y), got, want));
+                    }
+                }
+            }
+            // i1 has no arithmetic, and mixed widths never fold.
+            for &x in &grid_i1() {
+                for &y in &grid_i1() {
+                    let got = f(op, I1(x), I1(y));
+                    if !same(got, None) {
+                        return Err(disagree(name, I1(x), I1(y), got, None));
+                    }
+                }
+            }
+            for (a, b) in [
+                (I32(1), I64(1)),
+                (I64(1), I32(1)),
+                (I32(1), F64(1.0)),
+                (F64(1.0), I32(1)),
+                (I1(true), I32(1)),
+                (I32(1), I1(true)),
+                (I64(1), F64(1.0)),
+            ] {
+                let got = f(op, a, b);
+                if !same(got, None) {
+                    return Err(disagree(name, a, b, got, None));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Judge a cmp table against Rust. `Err` names the first
+    /// disagreement.
+    pub fn audit_cmp(f: CmpFn) -> Result<(), String> {
+        let ops = [
+            (CmpOp::Eq, "cmp.eq"),
+            (CmpOp::Ne, "cmp.ne"),
+            (CmpOp::Lt, "cmp.lt"),
+            (CmpOp::Le, "cmp.le"),
+            (CmpOp::Gt, "cmp.gt"),
+            (CmpOp::Ge, "cmp.ge"),
+        ];
+        for (op, name) in ops {
+            for &x in &grid_i32() {
+                for &y in &grid_i32() {
+                    let want = Some(I1(apply_ord(op, x, y)));
+                    let got = f(op, I32(x), I32(y));
+                    if !same(got, want) {
+                        return Err(disagree(name, I32(x), I32(y), got, want));
+                    }
+                }
+            }
+            for &x in &grid_i64() {
+                for &y in &grid_i64() {
+                    let want = Some(I1(apply_ord(op, x, y)));
+                    let got = f(op, I64(x), I64(y));
+                    if !same(got, want) {
+                        return Err(disagree(name, I64(x), I64(y), got, want));
+                    }
+                }
+            }
+            for &x in &grid_f64() {
+                for &y in &grid_f64() {
+                    // IEEE comparison, including the inf cases. No NaN
+                    // inputs exist, so no unordered-comparison surprises.
+                    let want = Some(I1(match op {
+                        CmpOp::Eq => x == y,
+                        CmpOp::Ne => x != y,
+                        CmpOp::Lt => x < y,
+                        CmpOp::Le => x <= y,
+                        CmpOp::Gt => x > y,
+                        CmpOp::Ge => x >= y,
+                    }));
+                    let got = f(op, F64(x), F64(y));
+                    if !same(got, want) {
+                        return Err(disagree(name, F64(x), F64(y), got, want));
+                    }
+                }
+            }
+            // i1 supports equality only; ordering booleans is refused.
+            for &x in &grid_i1() {
+                for &y in &grid_i1() {
+                    let want = match op {
+                        CmpOp::Eq => Some(I1(x == y)),
+                        CmpOp::Ne => Some(I1(x != y)),
+                        _ => None,
+                    };
+                    let got = f(op, I1(x), I1(y));
+                    if !same(got, want) {
+                        return Err(disagree(name, I1(x), I1(y), got, want));
+                    }
+                }
+            }
+            for (a, b) in [
+                (I32(1), I64(1)),
+                (I64(1), I32(1)),
+                (I32(1), F64(1.0)),
+                (F64(1.0), I32(1)),
+                (I1(true), I32(1)),
+                (I32(1), I1(true)),
+                (I64(1), F64(1.0)),
+            ] {
+                let got = f(op, a, b);
+                if !same(got, None) {
+                    return Err(disagree(name, a, b, got, None));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_ord<T: PartialOrd + PartialEq>(op: CmpOp, x: T, y: T) -> bool {
+        match op {
+            CmpOp::Eq => x == y,
+            CmpOp::Ne => x != y,
+            CmpOp::Lt => x < y,
+            CmpOp::Le => x <= y,
+            CmpOp::Gt => x > y,
+            CmpOp::Ge => x >= y,
+        }
+    }
+
+    // ---- the seven saboteurs (mirrors docs/phase/NEXT-PHASE.md §2) ----
+
+    pub fn sab_add_i32(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (ArithOp::Add, I32(x), I32(y)) = (op, a, b) {
+            return x.checked_mul(y).and_then(|v| v.checked_add(1)).map(I32);
+        }
+        eval_arith(op, a, b)
+    }
+    pub fn sab_add_i64(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (ArithOp::Add, I64(x), I64(y)) = (op, a, b) {
+            return x.checked_mul(y).and_then(|v| v.checked_add(1)).map(I64);
+        }
+        eval_arith(op, a, b)
+    }
+    pub fn sab_sub_swapped(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (ArithOp::Sub, I32(x), I32(y)) = (op, a, b) {
+            return y.checked_sub(x).map(I32);
+        }
+        eval_arith(op, a, b)
+    }
+    pub fn sab_mul_is_add(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (ArithOp::Mul, I32(x), I32(y)) = (op, a, b) {
+            return x.checked_add(y).map(I32);
+        }
+        eval_arith(op, a, b)
+    }
+    pub fn sab_div_is_mul(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (ArithOp::Div, I32(x), I32(y)) = (op, a, b) {
+            return x.checked_mul(y).map(I32);
+        }
+        eval_arith(op, a, b)
+    }
+    /// f64 saboteur: keeps a NaN result instead of refusing it. Only the
+    /// f64 leg can catch this one.
+    pub fn sab_f64_keeps_nan(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (ArithOp::Add, F64(x), F64(y)) = (op, a, b) {
+            return Some(F64(x + y));
+        }
+        eval_arith(op, a, b)
+    }
+    pub fn sab_lt_is_le(op: CmpOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (CmpOp::Lt, I32(x), I32(y)) = (op, a, b) {
+            return Some(I1(x <= y));
+        }
+        eval_cmp(op, a, b)
+    }
+    pub fn sab_ge_is_gt(op: CmpOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (CmpOp::Ge, I64(x), I64(y)) = (op, a, b) {
+            return Some(I1(x > y));
+        }
+        eval_cmp(op, a, b)
+    }
+    /// i1 saboteur: invents an ordering for booleans the table refuses.
+    pub fn sab_i1_invents_ordering(op: CmpOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+        if let (CmpOp::Lt, I1(x), I1(y)) = (op, a, b) {
+            return Some(I1(!x & y));
+        }
+        eval_cmp(op, a, b)
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use super::oracle::*;
+
+    #[test]
+    fn eval_arith_matches_rust_checked_arithmetic() {
+        audit_arith(super::eval_arith).expect("fold table disagrees with Rust");
+    }
+
+    #[test]
+    fn eval_cmp_matches_rust_comparison() {
+        audit_cmp(super::eval_cmp).expect("cmp table disagrees with Rust");
+    }
+
+    /// Assert every saboteur is rejected, AND rejected for the right
+    /// reason — the reported disagreement must name the operation that
+    /// was corrupted. An oracle that errors on the wrong arm would pass
+    /// a bare `is_err()` check while being broken.
+    fn expect_caught<F: Copy>(
+        cases: &[(&str, F, &str)],
+        audit: impl Fn(F) -> Result<(), String>,
+    ) {
+        let mut bad = vec![];
+        for &(name, f, want_op) in cases {
+            match audit(f) {
+                Ok(()) => bad.push(format!("{name}: ESCAPED — oracle is blind to it")),
+                Err(msg) if !msg.contains(want_op) => {
+                    bad.push(format!("{name}: caught, but on the wrong arm: {msg}"))
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(bad.is_empty(), "sabotage battery: {bad:#?}");
+    }
+
+    /// D1 red/green: exactly the seven fold-table corruptions measured
+    /// in docs/phase/NEXT-PHASE.md §2, five of which survived the whole
+    /// 121-test suite (the 10,000-fabric corpus included) before this
+    /// oracle existed. Without this fixture the oracle could be vacuous
+    /// — a check that passes everything tests nothing.
+    #[test]
+    fn the_seven_documented_sabotages_are_caught() {
+        expect_caught(
+            &[
+                ("i32 add -> x*y+1", sab_add_i32 as ArithFn, "arith.add"),
+                ("i64 add -> x*y+1", sab_add_i64 as ArithFn, "arith.add"),
+                ("i32 sub -> y-x (swapped)", sab_sub_swapped as ArithFn, "arith.sub"),
+                ("i32 mul -> x+y", sab_mul_is_add as ArithFn, "arith.mul"),
+                ("i32 div -> x*y", sab_div_is_mul as ArithFn, "arith.div"),
+            ],
+            audit_arith,
+        );
+        expect_caught(
+            &[
+                ("cmp i32 Lt -> <=", sab_lt_is_le as CmpFn, "cmp.lt"),
+                ("cmp i64 Ge -> >", sab_ge_is_gt as CmpFn, "cmp.ge"),
+            ],
+            audit_cmp,
+        );
+    }
+
+    /// The f64 and i1 legs are new in R1 (the grid widening). They must
+    /// earn their place: each catches a corruption the integer legs
+    /// structurally cannot see.
+    #[test]
+    fn the_widened_f64_and_i1_legs_catch_their_own_sabotages() {
+        expect_caught(
+            &[("f64 add keeps NaN", sab_f64_keeps_nan as ArithFn, "arith.add")],
+            audit_arith,
+        );
+        expect_caught(
+            &[("cmp i1 invents ordering", sab_i1_invents_ordering as CmpFn, "cmp.lt")],
+            audit_cmp,
+        );
+    }
+}
