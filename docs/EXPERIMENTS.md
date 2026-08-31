@@ -1,4 +1,4 @@
-# EXPERIMENTS — llvm-fabric v0 spike
+# EXPERIMENTS — llvm-fabric v0 spike + v1 lane
 
 **What this is:** the experimentation leg of the keel (README.md). The keel
 claims a cell-model IR with inspectable history is worth building. This
@@ -7,15 +7,21 @@ on this machine (WSL2, rustc 1.97.1, debug build unless noted). Every
 claim cites the test or command that produced it. Where something is a
 toy, it says toy.
 
+**Layout:** §1–6 are the v0 spike as measured at f9dcd85 (kept verbatim —
+the doc's own N4 law; where v1 changed the facts, the v1 section says
+so, and stale v0 claims carry a pointer). §7 is the v0 ledger. **§8+
+is the v1 lane** (control wires, inlining, the Weft) — the current edge.
+
 Code: `experiments/llvm-fabric/` (zero-dependency Rust crate).
 Run everything yourself:
 
 ```
 cd experiments/llvm-fabric
-cargo test                          # 64 tests, all green
-cargo run --release -- fuzz         # 10,000-fabric corpus
-cargo run --release -- bench        # size/serialize numbers
+cargo test                          # 99 tests, all green (was 64 at f9dcd85)
+cargo run --release -- fuzz         # 10,000-fabric corpus (now with phis)
+cargo run --release -- bench        # size/serialize/signature numbers
 cargo run --release -- pipeline examples/foldme.fabric
+cargo run --release -- inline examples/inlineme.v1fabric   # v1 lane
 ```
 
 ---
@@ -103,6 +109,12 @@ mutated:               4540
 Honest notes:
 - 1,370 of 4,540 mutated fabrics were **still valid** — mutations are
   corruptions, not guarantees of invalidity. Counted, not hidden.
+- **v1 correction (see §7.2):** the v0 generator NEVER generated a phi —
+  the phi step consulted `predecessors()` before terminators existed,
+  so it always saw "no predecessors." The 239,691 walks above never
+  touched a phi; the phi-relevant codes (V05/V06/V14) were exercised
+  only by unit tests. Fixed in v1; the corpus numbers above are
+  historical.
 - The full sweep (verify + text roundtrip + per-cell provenance + 4-pass
   pipeline + replay + conservation) runs in ~2.7 s debug / ~0.6 s release
   for 10,000 fabrics.
@@ -433,3 +445,273 @@ by hand, feature set hand-picked.
   @ `2e5469e` (76/76 green).
 - Nothing outside `experiments/batten-spike/` touched except this
   appendix.
+
+---
+
+# v1 LANE — control wires, inlining, the Weft
+
+Started 2026-08-30, same machine, same rules: red/green per pass,
+reachable hashes, conservation, N4 append-only, measured numbers, cargo
+test green before every commit. Suite: **64 → 99 tests** (26 ctrl/verify,
+7 program, 7 inline, 5 weft/sign, 1 v1-pipeline, plus fixture updates —
+every commit green; the v0 suite stayed green throughout except one
+fixture semantic change, §8.4).
+
+## 8. Control wires — provenance crosses the control edge
+
+v0 booked the gap (§4(a) Surprise, §5.2): *"data provenance does not
+cross control edges — a phi's walk never reaches the branch condition."*
+v1 closes it (`src/ctrl.rs`, 406 lines incl. tests).
+
+- **Ctrl edges are explicit**: one edge per (terminator → gated region);
+  terminators are the only ctrl-wire source (ARCHITECTURE §1.1); a phi
+  is a mux whose select lines are the incoming terminator wires ([K-r1]).
+- **The full walk** (`ctrl::full_provenance`) = the v0 data walk + the
+  **backward control closure** of the queried cell's region (every
+  terminator from which the region is reachable), each carrying its
+  condition's data subtree. The money shot, `demo.fabric` phi %9:
+
+```
+v0 data walk                     v1 full walk
+%9 = phi [then: %4] [else: %7]   %9 = phi [then: %4] [else: %7]
+  %4 = const i64 1i64              %4 = const i64 1i64
+  %7 = const i64 2i64              %7 = const i64 2i64
+                                   ctrl: %5 = br %3, then, else   <- the edge crossed
+                                     %3 = cmp.lt %2, %1
+                                       %2 = arith.add i32 %0, %1
+                                         %0 = param i32           <- v0 said unreachable
+                                         %1 = const i32 42
+                                   ctrl: %6 = jump join            <- the mux select lines
+                                   ctrl: %8 = jump join
+```
+
+  Tested as the red/green pair: v0's
+  `prov::tests::provenance_of_phi_reaches_all_roots` (asserts the param
+  is NOT reached — kept green) and v1's
+  `ctrl::tests::full_provenance_of_phi_crosses_the_control_edge`
+  (asserts it IS, plus the jumps). Both hold; the walks answer different
+  questions, and both are now queryable.
+
+- **Why ctrl expands only at the root** (documented theorem in ctrl.rs):
+  every data ancestor lives in the same region (same closure), the entry
+  region (empty closure), or a phi join region P — a *predecessor* — so
+  closure(P) ⊆ closure(root). The root's closure covers everything;
+  nothing is approximated. This is also why the walk is cheap.
+
+- **Loop-carried influences are real and are CUT with a marker.** The
+  corpus (seed 1026845) found a genuine cycle: `add → its own region's
+  gate → branch cond → back to the add`. In a cyclic fabric, a value's
+  iteration-k+1 self truly depends on its iteration-k self. The walk
+  marks the re-entry `revisit: %8 ...` instead of diverging or erroring
+  (`ctrl::tests::loop_carried_influence_is_cut_with_a_marker`).
+  Markers are only reachable when the region graph is cyclic — in
+  acyclic region graphs they cannot appear (argued in ctrl.rs).
+
+- **V16 (control well-formedness):** a phi must carry a join for EVERY
+  real predecessor. A control edge without a mux input is exactly
+  quilt-scratch's "silent no-op wire" (TILE-CONTRACT, scout's sharpest
+  attack finding) — a value could arrive on a path the phi never
+  selects. Reject/accept unit tests + a targeted mutation (drop a
+  join+operand pair) put it in the corpus path.
+
+- **V17 (operand acyclicity):** the corpus (seed 1032071) found that a
+  mutated self-joining phi (`%10 = phi [r1: %10]`) sends v0's
+  `Cell::ty_of` into **infinite recursion inside verify** (phi type =
+  first operand's type). V17 runs an iterative cycle check over the
+  operand graph BEFORE any ty_of call. Two unit tests (self-cycle,
+  indirect cycle through arith).
+
+**Corpus (10,000 fabrics, seed 0xFAB1C, release, 2.7 s):**
+
+```
+phis generated:        15333   <- v0 generated ZERO (see 8.3)
+cells provenance-walked: 255446
+ctrl-prov failures:    0       <- full walk holds on every cell of every fabric
+prov failures:         0
+roundtrip failures:    0
+weft failures:         0       <- see 8.3
+replay failures:       0
+panics:                0
+mutated:               4430
+  still valid:         1367
+  rejected:            3063 (by code)
+    V01 1196  V02 11  V03 615  V04 613  V06 10  V07 12  V08 149
+    V09 34    V10 26  V11 173  V12 14   V13 6   V14 1   V15 1
+    V16 175   V17 27
+```
+
+(v0's histogram at f9dcd85: V01 1323, V03 644, V04 675, V08 191, V09 38,
+V10 34, V11 232, V12 28, V15 5 — different because the corpus now
+generates phis and mutation 10 exists.)
+
+## 8.1 The third pass: inlining on fabrics
+
+`src/passes/inline.rs` (372 lines incl. tests) + `src/program.rs` (379)
++ `CellKind::Call` + V18 + program codes P00–P04. The scout's build
+order said inlining is hardest and ships last; it shipped last.
+
+- **Programs**: `fabric v1` multi-function format (fn bodies delegate
+  to the v0 parser; line numbers offset-adjusted — tested).
+  Program-level verification checks what a lone fabric cannot: callee
+  exists (P01), arity (P02), argument types (P03), return-type
+  agreement (P04). Each code has a unit test.
+- **The graft**: callee params are NOT grafted — uses rewire to caller
+  args at graft time. The callee's `ret` is not grafted — call uses
+  retarget to the mapped return value. Everything else grafts in order
+  under fresh ids before the call site. The call cell is removed WITH a
+  conservation ledger entry naming the graft:
+  `- %4 (inlined 'add2': 1 cells grafted, 2 params bound to caller
+  args, ret -> %7)`.
+- **v1 scope, stated**: straight-line callees only (single region,
+  acyclic entry, exactly-one-value return). CFG-grafting needs the
+  region-edit diff vocabulary v0 explicitly deferred (§6.1) — still
+  open. Ineligible callees are SKIPPED WITH RECORDED NOTES (the diff
+  record carries `notes`; "a skip without a note would be the silent
+  no-op" — tested for all four skip kinds).
+- **The payoff shot** (`provenance_crosses_the_inline_boundary`):
+
+```
+before inline                      after inline
+%3 = ret %2                        %8 = arith.add i32 %9, %0
+  %2 = call i32 add2 %0, %1          %9 = const i32 42          <- 20+22, folded THROUGH the graft
+                                     %0 = param i32             <- caller root, through the graft
+```
+
+  The walk crosses the inline boundary in both directions: forward
+  (fold cascades through grafted cells) and backward (the inlined
+  result's def chain runs into the caller's call-site values). And
+  `prov_history(%2)` keeps the story after removal: "tick 2 inline:
+  removed (inlined 'add2' ...)".
+- **v1 pipeline**: constfold → dce → inline → constfold → dce; the
+  second fold crosses the boundary (tested:
+  `v1_pipeline_folds_through_the_inline_boundary`; replay reproduces
+  all 6 stages bit-identically). Nested calls inline on the next sweep
+  (tested). CLI: `cargo run -- inline examples/inlineme.v1fabric`.
+
+**Inline diff sizes, measured** (`cargo run --release --bin inlinebench`;
+caller with N call sites to a callee with B body cells, v1 pipeline):
+
+```
+callsites  calleebody  cells     orig-B  final-B  history-B  hist/final
+1          1           4 -> 4       105      111        294        2.6
+4          4           7 -> 19      191      635       1578        2.5
+8          8           11 -> 67     307     2315       4926        2.1
+16         16          19 -> 259    554     9036      17393        1.9
+```
+
+"Large diffs" confirmed — but note the contrast with v0's foldchain
+(1,600× final): inline history scales ~2× final because it ADDS cells
+(with per-cell AddCell + ledger) rather than deleting cascades. All
+shapes verify + conserve + weft-hold at the end of the run (asserted in
+the tool itself).
+
+## 8.2 The Weft — signature every tick + the progress law
+
+`src/sign.rs` (120 lines) + History extension (`diff.rs`). Reverse-walk
+round-3 keeper: record the fabric signature at EVERY tick from day one —
+"nearly free to record and impossible to recover retroactively." And
+round-4's logic critique: progress must be mechanical, "or it launders
+into vibes."
+
+- **Signature**: FNV-1a 64 over the CANONICAL TEXT (print byte-for-byte
+  — the fiber declared, THESIS-V3 discipline). NOT cryptographic; the
+  claim is tamper *detection* via chain + replay, never resistance (the
+  phantom-hash law from quilt-verilog, carried in the module doc).
+- **TickSig { epoch, pass, sig, chain, advanced, note }**, one per
+  tick, chained: chain_i = fnv(chain_{i-1} ‖ epoch ‖ pass ‖ sig).
+  Progress is DERIVED from the diff: edits > 0 → "advanced (N edits)";
+  else → "fixed point — no edits fired". No pass-author judgment
+  exists in the API. The pipeline output reads:
+
+```
+tick 0 constfold sig=186d44749d0c55d8 chain=bbf3788c226f7f64 :: fixed point — no edits fired
+tick 1 dce       sig=73d5135f996980bb chain=7f0e1f990be63119 :: advanced (1 edits)
+tick 2 inline    sig=4f951584dd7dc027 chain=bd3cd683d4c4e0ae :: advanced (6 edits)
+tick 3 constfold sig=7c0d2caa872628c2 chain=872a46f45e0c2a80 :: advanced (3 edits)
+tick 4 dce       sig=d3752070c04723cd chain=0e34ba352bf432bb :: advanced (2 edits)
+```
+
+- **check_weft** — the law, checkable: all-or-nothing (a partial Weft
+  is a violation: "weft covers 3/4 ticks"), gapless epochs, non-empty
+  notes, non-advancing ticks must declare fixed point. v0-style
+  push-only histories are labeled pre-law and allowed (empty weft).
+- **verify_chain** — recomputes per-stage signatures against replayed
+  stages and re-links the chain; a tampered stage fails naming its
+  tick (`tampered_stage_breaks_the_chain_with_the_tick_number`).
+- The corpus enforces both on every pipeline run (10,000/10,000 pass;
+  `weft failures: 0`).
+
+**Signature overhead, measured** (bench, sig-us column, medians of 21,
+release — signature = one canonical print + one FNV pass):
+
+```
+shape          cells  print-us  sig-us   sig/print
+chain-50         53       8.1     7.8       0.96
+chain-800       803     122.6   116.5       0.95
+diamonds-160   1443     171.7   176.6       1.03
+dag-800         803     134.5   126.1       0.94
+```
+
+≈ one print pass per tick. At v0's 4-tick pipeline that is 4 prints on
+top of ~4 verifies — and verify is 1.3–1.5× print at these sizes, so
+the Weft roughly doubles-to-triples nothing: it adds ~1/5 of a
+pipeline's existing per-tick cost. Honest caveat: it is O(fabric) per
+tick with no incrementality (a Merkle/cell-hash scheme is the v2 move,
+scout pass 1's mitigation); at 10k-cell fabrics with 100-tick
+pipelines this will need it.
+
+## 8.3 Failures, findings, surprises (first-class)
+
+1. **The v0 corpus never generated a phi** (generator ordering bug:
+   predecessors consulted before terminators placed; 0 phis in 2,000
+   fabrics, measured). The "239,691 provenance walks" never walked a
+   phi. Found while wiring ctrl-walk corpus coverage; fixed by deriving
+   preds from the planned terminator table; regression guard
+   (`st.phis > 0`) in the corpus test.
+2. **V17/ty_of infinite recursion** — a latent v0 crash-on-cycle in
+   verify, unreachable only because of (1). The fuzz-to-verifier loop
+   worked exactly as designed: the corpus found it within 10k once
+   phis existed.
+3. **Loop-carried provenance cycles are REAL** — not corruption. The
+   walk now marks them. This changed the module's contract from "Err on
+   cycle" to "cut with a marker" (§8).
+4. **One v0 fixture modified** (`v12_use_before_def_same_region`): the
+   original fixture was accidentally a V17 cycle (self-referencing
+   add), so V17 fired before V12. The fixture now uses a later cell —
+   same V12 intent, no longer accidentally testing V17. Semantic change
+   documented in the test body and here.
+5. **Inlining is straight-line only in v1** — the region-edit diff
+   vocabulary (RegionAdded/JoinDropped, §6.1 of v0) remains the real
+   blocker for CFG-grafting and const-branch folding alike. Not
+   laundered: skipped callees say so in recorded notes.
+6. **Signature is whole-fabric per tick** — measured cheap now, not
+   incremental; booked as v2 (§9).
+7. **ctrl walk cost**: the root-only expansion exists because expanding
+   at every tree node was measured unusable (~500× corpus slowdown
+   during development; the theorem in §8 makes root-only complete, not
+   approximate). Corpus time 2.7 s / 10k fabrics (v0: 0.6 s — the delta
+   buys phi generation + full-walk + weft checks on every fabric).
+
+## 8.4 What v2 should change
+
+1. **Region/edit vocabulary in diffs** — still #1 (unlocks CFG-graft
+   inlining, const-branch folding, region-DCE).
+2. **Incremental signatures** (Merkle per cell / content-addressed) —
+   bounded Weft cost at scale.
+3. **Maintained use/pred tables** — v0's O(n²)-ish verify is now the
+   largest measured cost in the pipeline (diamonds-160: 1.5 ms verify
+   vs 0.17 ms print).
+4. **Dominance-based scope rules** (v0 §6.5) — unchanged.
+5. **Interpreter + differential harness vs a reference compiler**
+   (ARCHITECTURE M2) — the ground truth that makes transforms like
+   inline *semantically* judged, not just structurally.
+6. **A negative corpus per code** — V16/V17 joined the mutant battery
+   by mutation; golden mutants per code remain the goal.
+
+## 8.5 Ledger (v1)
+
+- Commits: control wires (V16/V17 + generator fix) → calls/program/
+  inline → Weft/signatures/progress law → this file. Reachable in
+  `git log`; cargo test green before each (99/99 at HEAD).
+- Nothing deleted; the v0 sections of this file are the v0 record
+  (N4 applies to docs too).
