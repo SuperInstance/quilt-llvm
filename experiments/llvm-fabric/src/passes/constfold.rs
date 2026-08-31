@@ -22,7 +22,7 @@ use crate::ty::ConstVal;
 use crate::verify::verify;
 
 /// Fold one step of arithmetic. None = do not fold (overflow, div/0, NaN).
-fn eval_arith(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+pub(crate) fn eval_arith(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
     use ConstVal::*;
     match (op, a, b) {
         (ArithOp::Add, I32(x), I32(y)) => x.checked_add(y).map(I32),
@@ -53,7 +53,7 @@ fn eval_arith(op: ArithOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
     }
 }
 
-fn eval_cmp(op: CmpOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
+pub(crate) fn eval_cmp(op: CmpOp, a: ConstVal, b: ConstVal) -> Option<ConstVal> {
     use ConstVal::*;
     let r = match (op, a, b) {
         (CmpOp::Eq, I1(x), I1(y)) => x == y,
