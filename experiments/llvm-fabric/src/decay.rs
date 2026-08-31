@@ -91,7 +91,7 @@ pub fn demand_path(f: &Fabric, from: CellId) -> Option<Vec<CellId>> {
             path.reverse();
             return Some(path);
         }
-        for (user, _) in f.uses_of(cur) {
+        for &(user, _) in f.uses_of(cur) {
             if !prev.contains_key(&user) {
                 prev.insert(user, Some(cur));
                 q.push_back(user);

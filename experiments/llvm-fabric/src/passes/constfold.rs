@@ -149,19 +149,15 @@ pub fn const_fold(f: &Fabric) -> Result<(Fabric, DiffRecord), String> {
                     index,
                     cell: Cell::new(region, CellKind::Const { ty, val }),
                 });
-                // 2. retarget every use (deterministic: uses_of scans asc)
-                for (user, slot) in g.uses_of(id) {
-                    let c = g.cell_mut(user).expect("present");
-                    let from = c.operands[slot as usize];
-                    c.operands[slot as usize] = new_id;
+                // 2. retarget every use (deterministic: the users row is
+                //    user-asc, slot-asc — same order the scan produced)
+                for (user, slot) in g.uses_of(id).to_vec() {
+                    let from = g.retarget(user, slot, new_id).expect("present user");
                     rec.edits.push(Edit::Retarget { cell: user, slot, from, to: new_id });
                 }
                 // 3. remove the folded cell, with ledger
                 let summary = crate::text::render_cell(&g, id);
-                let cells = &mut g.regions[region.0 as usize].cells;
-                let pos = cells.iter().position(|&c| c == id).expect("listed");
-                cells.remove(pos);
-                g.slab[id.0 as usize] = None;
+                g.remove_cell(id).expect("folded cell listed");
                 rec.edits.push(Edit::RemoveCell {
                     id,
                     ledger: format!("folded into {}", new_id),

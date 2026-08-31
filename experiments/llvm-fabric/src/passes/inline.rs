@@ -152,19 +152,13 @@ pub fn inline_calls(
         let ret_mapped = *map
             .get(&ret_val)
             .expect("ret operand is a param or a grafted cell");
-        for (user, slot) in g.uses_of(call_id) {
-            let c = g.cell_mut(user).expect("present");
-            let from = c.operands[slot as usize];
-            c.operands[slot as usize] = ret_mapped;
+        for (user, slot) in g.uses_of(call_id).to_vec() {
+            let from = g.retarget(user, slot, ret_mapped).expect("present user");
             rec.edits.push(Edit::Retarget { cell: user, slot, from, to: ret_mapped });
         }
         // remove the call cell, with the conservation ledger entry
         let summary = crate::text::render_cell(&g, call_id);
-        let region = g.cell(call_id).unwrap().region;
-        let cells = &mut g.regions[region.0 as usize].cells;
-        let pos = cells.iter().position(|&c| c == call_id).expect("listed");
-        cells.remove(pos);
-        g.slab[call_id.0 as usize] = None;
+        g.remove_cell(call_id).expect("call cell listed");
         rec.edits.push(Edit::RemoveCell {
             id: call_id,
             ledger: format!(

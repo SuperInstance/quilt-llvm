@@ -698,9 +698,13 @@ pipelines this will need it.
    inlining, const-branch folding, region-DCE).
 2. **Incremental signatures** (Merkle per cell / content-addressed) —
    bounded Weft cost at scale.
-3. **Maintained use/pred tables** — v0's O(n²)-ish verify is now the
-   largest measured cost in the pipeline (diamonds-160: 1.5 ms verify
-   vs 0.17 ms print).
+3. **Maintained use/pred tables** — DISCHARGED on `r2-use-tables`
+   (2026-08-30): `usetables.rs`, O(degree) maintenance on every
+   sanctioned edit, queries are table lookups, derivable bit-identical
+   on the 10k corpus. Diamonds-family verify 1.90 → 0.97 fitted
+   exponent (1457 µs → 60 µs at diamonds-160). The remaining verify
+   quadratic is V12's `index_in_region` position scan (chain/dag
+   families), still booked. Full numbers: docs/phase/USE-TABLES.md.
 4. **Dominance-based scope rules** (v0 §6.5) — unchanged.
 5. **Interpreter + differential harness vs a reference compiler**
    (ARCHITECTURE M2) — the ground truth that makes transforms like

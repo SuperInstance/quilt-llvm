@@ -51,7 +51,7 @@ pub fn ctrl_edges(f: &Fabric) -> Vec<CtrlEdge> {
                 if let Some(&last) = region.cells.last() {
                     if let Some(c) = f.cell(last) {
                         if c.is_terminator() {
-                            out.push(CtrlEdge { term: last, gated: succ });
+                            out.push(CtrlEdge { term: last, gated: *succ });
                         }
                     }
                 }
@@ -73,7 +73,7 @@ pub fn controlling_regions(f: &Fabric, target: RegionId) -> Vec<RegionId> {
     let mut seen: Vec<RegionId> = vec![];
     let mut work = vec![target];
     while let Some(r) = work.pop() {
-        for p in f.predecessors(r) {
+        for &p in f.predecessors(r) {
             if !seen.contains(&p) {
                 seen.push(p);
                 work.push(p);

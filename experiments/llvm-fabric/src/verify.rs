@@ -233,7 +233,7 @@ pub fn verify(f: &Fabric) -> Result<(), VerifyError> {
         let c = f.cell(id).expect("present");
         if let CellKind::Phi { joins } = &c.kind {
             let preds = f.predecessors(c.region);
-            for &p in &preds {
+            for &p in preds {
                 if !joins.contains(&p) {
                     return Err(fail(
                         "V16",
