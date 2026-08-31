@@ -383,3 +383,132 @@ that can re-plan everything downstream cheaply.
 - The cross-repo status lines in the brief (quilt-scratch 89/89,
   ta-bridge 23/23, vibe-panel 23/23) are **carried as reported, not
   re-run** by this lane (D7). Only quilt-llvm's 121/121 was re-run here.
+
+---
+
+# 10. Addendum — R1 adjudication after lanes 1 and 2 (2026-08-30)
+
+*Written after the fold-table oracle landed (`f70fb5b`, suite 125/125)
+and after reviewing the lane-2 shape audit on branch `r1-shape-audit`
+(`e086555`, 121/121 on that branch). Reviewed adversarially, per the
+house rule that a lane's findings are red tests, not prose.*
+
+## 10.1 What I verified myself
+
+Not taken on trust. Re-run from a `git archive e086555` pin:
+
+- **Reproduces bit-for-bit.** cells 255,446 · phis 15,333 · calls 0 ·
+  equal-target branches 969 · dead-on-arrival 41.3%. The cell and phi
+  counts match EXPERIMENTS §9.2 exactly — a genuine external anchor.
+- **C4 confirmed independently of the audit binary.** Using only the
+  library API (`index_in_region` / `region().cells`) over 2,000 fabrics:
+  **0 of 3,078 phis sit at a spine head.** And `verify.rs` contains no
+  phi-placement check at all — V03/V04 check *terminator* position only.
+  ARCHITECTURE.md:268 mandates "phi cells sit only at a spine head."
+  **The spec rule is enforced nowhere and the generator emits its
+  opposite 100% of the time.** This is the audit's most valuable find.
+
+## 10.2 Accepted findings
+
+1. **C4 (spec conflict)** — verified above. Promoted to a Casey decision
+   (§10.5).
+2. **C1 (0 calls)** — every M5/inline corpus claim rests on hand
+   fixtures. EXPERIMENTS said so in prose; it is now a measured zero.
+3. **C6's datum** — phi consumers are phi (5,866) and ret (1,455);
+   arith/cmp/branch **0**. No pass decision in the corpus has ever
+   depended on a phi's value.
+4. **C9 × R1 lane 1 are complements, and this is mutual validation.**
+   Corpus constants are confined to small non-boundary domains; the
+   oracle's grid is exactly ±MAX/MIN/MAX−1. Neither could have found the
+   other's bugs. Independent support that lane 1 was worth landing.
+5. **The 7.6% equal-target correction.** Reading the code said 0; the
+   histogram said 969/12,703. Measurement overruled reading, and the
+   lane published the correction against itself. That is the house
+   method working.
+6. **§2.8 corrects THIS plan.** NEXT-PHASE §3 R3 worried that region-DCE
+   would be "green on a corpus containing no unreachable regions."
+   Measured false: **57.38% of fabrics contain ≥1**. My concern was
+   wrong; R3 has real material. Recorded rather than quietly dropped.
+
+## 10.3 Attacks that stand
+
+1. **The measurer is untested — 564 lines, 0 tests, suite unchanged at
+   121.** The audit's thesis is that unverified oracles produce
+   confident wrong numbers; the audit is itself an unverified oracle.
+   Two counters have external anchors (§9.2); the *decision-driving*
+   ones — spine-head position, phi-consumers-by-kind, cyclic frequency,
+   unreachable-region rate — have none. I verified C4 by hand and it
+   held, which raises confidence without discharging the problem.
+   **Action: ~60 lines of tests over hand-built fabrics of known shape,
+   before these numbers are cited again.** Cheapest item in the phase,
+   and it gates everything the audit is about to change. See §10.4.
+2. **C6's gloss overstates its own datum.** "every loop-shaped fabric is
+   cyclic but computation-free" contradicts EXPERIMENTS §8, which
+   documents a genuine loop-carried influence cycle (seed 1026845:
+   `add → its own region's gate → branch cond → back to the add`) with
+   no phi involved. The corpus **does** carry loop-carried influence —
+   through control wires, which is exactly what §8's ctrl machinery was
+   built and tested on. The correct, narrower claim: **no phi
+   participates in loop-carried dataflow.** The number is right; the
+   sentence is not, and R3 would under-credit the ctrl lane if it read
+   the sentence.
+3. **"100% sit immediately before the terminator"** — my independent run
+   gives 3,012/3,078 = **97.9%**, not 100%. Minor, but stated as exact.
+4. **Generator ≠ corpus.** The cannot-emit list bounds `gen_fabric`
+   output. Mutation is a second shape-production path (4,430 mutants,
+   1,367 staying valid), and mutants reach `verify` — so
+   verifier-derived claims (the V-code histogram) are bounded *less*
+   tightly than pipeline-derived ones, which only ever see generator
+   output. C5 notices this for one row; the general principle should be
+   stated once.
+5. **Two seeds is stability, not independence.** C1–C8 are properties of
+   the generator's *code*; no second seed base can falsify them. Framed
+   honestly as a stability run, but §2.9's "every conclusion reproduces"
+   invites over-reading.
+
+## 10.4 What changes in the plan
+
+- **R1 gains lane 4: test the shape-audit binary** (~60 lines, hand-built
+  fabrics of known shape). Blocking: SHAPE-AUDIT's numbers may not
+  re-scope R3 until its measurer is pinned. §10.3(1).
+- **R3's gate (§6) gains a material check per pass**, now measurable
+  instead of assumed:
+  - const-branch folding — **has material** (24.0% of branches are
+    const-conditioned);
+  - region-DCE — **has material** (57.38% of fabrics have an
+    unreachable region);
+  - CFG-graft inlining — **has none** (0 calls, C1);
+  - any pass reasoning about phi *values* — **has none** (C6).
+- **The generator follow-up SHAPE-AUDIT §4(a) is promoted from optional
+  to an R3 prerequisite.** All three R3 passes reason about phi values;
+  C4 + C6 mean that capability is untested by construction. Either the
+  generator grows it or R3's exit criteria must name the hand fixtures
+  carrying the load, explicitly.
+- **§3 R3's unreachable-region worry is withdrawn** as measured false
+  (§10.2.6).
+- **Merge note:** `r1-shape-audit` predates the oracle and reports
+  121/121; master is 125/125. The branch touches different files and
+  should merge clean, but its suite line must be re-run post-merge or it
+  will read as a regression.
+
+## 10.5 New Casey decision
+
+**C4: the spec says phi-at-spine-head; the verifier does not enforce it;
+the generator violates it 100% of the time.** Three ways out — amend
+ARCHITECTURE §2.1 to match the emitted placement, add a V-code and fix
+the generator, or declare the rule advisory. This is the same class as
+the M2 ladder amendment (§5): a written doctrine the implementation has
+silently diverged from. Not the strategic lane's call. Until it is
+decided, no corpus number should be cited as evidence about phi
+placement in either direction.
+
+## 10.6 R1 status
+
+| lane | state | suite |
+|---|---|---|
+| 1 — fold-table oracle | **landed** (`f70fb5b`) | 125/125 on master |
+| 2 — generator shape audit | done on branch, **unmerged**, measurer untested | 121/121 on branch |
+| 3 — semantic mutation tier | branch `r1-sem-mutants` exists; not reviewed here | — |
+| 4 — test the measurer | **new**, blocking (§10.4) | — |
+
+R1's one-week cap still holds. Lane 4 is hours, not days.
