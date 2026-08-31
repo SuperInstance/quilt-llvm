@@ -1,0 +1,113 @@
+# shape-audit raw dump (iters=10000, seed0=0xd3ca5)
+fabrics verified:            10000  (gen_verify_fail: 0)
+cells total:                 255198  min 2  max 63  mean 25.52
+value cells:                 220252  dead-on-arrival 91115 (41.4% of value cells)
+
+## cells-per-fabric histogram
+     >40: 1291 (12.91%)
+    1-10: 1326 (13.26%)
+   11-20: 2485 (24.85%)
+   21-30: 2513 (25.13%)
+   31-40: 2385 (23.85%)
+## regions-per-fabric histogram
+  1 regions: 1682 (16.82%)
+  2 regions: 1662 (16.62%)
+  3 regions: 1664 (16.64%)
+  4 regions: 1675 (16.75%)
+  5 regions: 1654 (16.54%)
+  6 regions: 1663 (16.63%)
+## ctrl-edges-per-fabric histogram (br=2, jmp=1, ret=0)
+  0 edges: 1682 (16.82%)
+  1 edges: 220 (2.20%)
+  2 edges: 827 (8.27%)
+  3 edges: 1390 (13.90%)
+  4 edges: 1450 (14.50%)
+  5 edges: 1314 (13.14%)
+  6 edges: 1183 (11.83%)
+  7 edges: 873 (8.73%)
+  8 edges: 609 (6.09%)
+  9 edges: 291 (2.91%)
+  10 edges: 136 (1.36%)
+  11 edges: 21 (0.21%)
+  12 edges: 4 (0.04%)
+## phis-per-fabric histogram (4 = 4+, cap)
+  0 phis: 2570 (25.70%)
+  1 phis: 2582 (25.82%)
+  2 phis: 2657 (26.57%)
+  3 phis: 1523 (15.23%)
+  4 phis: 668 (6.68%)
+
+## cell-kind census (all fabrics)
+     arith: 56866 (5.687/fabric)
+    branch: 12509 (1.251/fabric)
+       cmp: 29738 (2.974/fabric)
+     const: 103379 (10.338/fabric)
+      jump: 15735 (1.573/fabric)
+     param: 15014 (1.501/fabric)
+       phi: 15255 (1.526/fabric)
+       ret: 6702 (0.670/fabric)
+
+## ctrl graph
+  ctrl edges (with multiplicity): 40753
+  unique region->region edges:    39829
+  branch with equal targets:      924
+  self-loops (jmp r->r):          10110  fabrics with one: 6443
+  back/cycle edges (u->v, v=>u):  23719
+  FABRICS WITH >=1 CYCLE:         7640 (76.40%)
+  regions on a cycle:             18625 (1.863/fabric)
+  cycles reachable from entry:    7170 fabrics (71.70%)
+  unreachable regions:            11595 total; fabrics with >=1: 5647 (56.47%)
+
+## phis
+  total phis:                15255 (1.526/fabric)
+  phis per region (max seen): 1
+  phi type i32: 15255
+  join size 1: 8288
+  join size 2: 5434
+  join size 3: 1344
+  join size 4: 173
+  join size 5: 16
+  at spine head:             0 / not at head: 15255
+  in entry region:           3725
+  same-region operands:      5803
+  partial pred coverage:     0
+  unconsumed phis:           9491
+  phi consumers by kind:
+         phi: 5862
+         ret: 1449
+
+## calls
+  call cells: 0   max call depth: 0
+
+## type coverage
+  value cells by type:
+    f64: 43000
+    i1: 69027
+    i32: 65307
+    i64: 42918
+  use-wires by source type:
+    f64: 37471
+    i1: 52717
+    i32: 87173
+    i64: 36941
+  fabrics containing at least one value of type:
+    f64: 9047 (90.47%)
+    i1: 9678 (96.78%)
+    i32: 9866 (98.66%)
+    i64: 9059 (90.59%)
+  consts by type: {"f64": 27508, "i1": 24185, "i32": 24197, "i64": 27489}
+  distinct const values: 18541
+  i32 consts: min -500 max 499 negatives 8902
+  i64 consts: min 0 max 999985 negatives 0
+  f64 consts: min -12.5 max 49 non-multiples-of-0.125: 0
+  i1 consts: true 12465 false 11720
+
+## ops
+  arith ops: {"arith.add": 14133, "arith.div": 14363, "arith.mul": 14152, "arith.sub": 14218}
+  arith with duplicate operands (a==b): 17111
+  arith.div with const-zero RHS:         914
+  cmp ops:  {"cmp.eq": 5076, "cmp.ge": 4911, "cmp.gt": 5002, "cmp.le": 4925, "cmp.lt": 4822, "cmp.ne": 5002}
+  cmp operand types: {"f64": 4153, "i1": 5317, "i32": 16407, "i64": 3861}
+  branch cond source kinds: {"arith": 3102, "cmp": 6428, "const": 2884, "param": 95}
+  ret: with value 4625 / void 2077 / value-is-phi 1449
+  params: 15014 types {"f64": 1177, "i1": 1060, "i32": 11681, "i64": 1096}
