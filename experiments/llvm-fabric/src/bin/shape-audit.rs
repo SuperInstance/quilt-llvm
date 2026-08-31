@@ -562,3 +562,433 @@ fn main() {
     println!("  params: {} types {:?}", a.params, a.param_ty);
     let _ = CmpOp::Eq;
 }
+
+// ===========================================================================
+// Tests — validate the MEASURER against independent ground truth (R1 lane 4).
+//
+// Three layers:
+//   1. corpus_totals_*: the full 10k published corpus reproduces the
+//      EXPERIMENTS §9.2 numbers from scratch (phis 15,333 / cells 255,446
+//      @0xFAB1C; 255,198 @0xD3CA5) — not parsed from the dump, regenerated.
+//   2. histogram_invariants_*: hand-built corpus — every histogram sums to
+//      the fabric count, every census sums to the cells total.
+//   3. detector_*: synthetic fixtures where the cannot-emit detectors fire
+//      (or stay silent) by construction.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audit_of(fabrics: &[Fabric]) -> Audit {
+        let mut a = Audit::new();
+        for f in fabrics {
+            a.fabric(f);
+        }
+        a
+    }
+
+    fn run_corpus(iters: u64, seed0: u64) -> Audit {
+        let mut a = Audit::new();
+        for i in 0..iters {
+            let seed = seed0.wrapping_add(i).max(1);
+            let f = gen_fabric(&mut Rng::new(seed));
+            if verify(&f).is_err() {
+                a.gen_verify_fail += 1;
+                continue;
+            }
+            a.fabric(&f);
+        }
+        a
+    }
+
+    // ---- hand-built fabric helpers (deliberately NOT via gen_fabric) ----
+
+    fn simple_fabric(n_consts: usize) -> Fabric {
+        // entry: n_consts consts + ret(void)
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        for i in 0..n_consts {
+            f.add_cell(
+                r0,
+                Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(i as i32) }),
+            );
+        }
+        f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        f
+    }
+
+    fn wire(f: &mut Fabric, user: CellId, slot: usize, from: CellId) {
+        let ops = &mut f.cell_mut(user).unwrap().operands;
+        while ops.len() <= slot {
+            ops.push(CellId(u32::MAX));
+        }
+        ops[slot] = from;
+    }
+
+    /// entry: c0=const0, phi@head, ret(phi). One region, one phi.
+    fn phi_at_head_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let phi = f.add_cell(r0, Cell::new(r0, CellKind::Phi { joins: vec![r0] }));
+        let c0 = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(1) }));
+        wire(&mut f, phi, 0, c0);
+        let ret = f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        wire(&mut f, ret, 0, phi);
+        f
+    }
+
+    /// entry: const, phi (NOT at head), ret(phi) — phi at index 1.
+    fn phi_not_at_head_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let c0 = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(1) }));
+        let filler = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+        let phi = f.add_cell(r0, Cell::new(r0, CellKind::Phi { joins: vec![r0] }));
+        wire(&mut f, phi, 0, c0);
+        let ret = f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        wire(&mut f, ret, 0, phi);
+        let _ = filler;
+        f
+    }
+
+    /// Two regions; branch with EQUAL targets (then == else).
+    fn branch_eq_targets_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let r1 = f.add_region("join");
+        let c = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+        let br = f.add_cell(r0, Cell::new(r0, CellKind::Branch { then_r: r1, else_r: r1 }));
+        wire(&mut f, br, 0, c);
+        f.add_cell(r1, Cell::new(r1, CellKind::Ret));
+        f
+    }
+
+    /// r0: ret. r1: ret. r1 unreachable from entry.
+    fn unreachable_region_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let r1 = f.add_region("island");
+        f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        f.add_cell(r1, Cell::new(r1, CellKind::Ret));
+        f
+    }
+
+    /// r0: ret; r1: jump back to r1 — self-loop on an unreachable region.
+    fn self_loop_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let r1 = f.add_region("loop");
+        f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        f.add_cell(r1, Cell::new(r1, CellKind::Jump { target: r1 }));
+        f
+    }
+
+    /// r0: c0=1, c1=0, div = c0/c1 (const-zero RHS), ret(div).
+    fn div_const_zero_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let c0 = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(1) }));
+        let cz = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(0) }));
+        let div = f.add_cell(r0, Cell::new(r0, CellKind::Arith { op: ArithOp::Div, ty: Type::I32 }));
+        f.cell_mut(div).unwrap().operands = vec![c0, cz];
+        let ret = f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        wire(&mut f, ret, 0, div);
+        f
+    }
+
+    /// r0: c0=1, dup = c0+c0 (duplicate operands), ret(dup).
+    fn dup_operand_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let c0 = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(1) }));
+        let add = f.add_cell(r0, Cell::new(r0, CellKind::Arith { op: ArithOp::Add, ty: Type::I32 }));
+        f.cell_mut(add).unwrap().operands = vec![c0, c0];
+        let ret = f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        wire(&mut f, ret, 0, add);
+        f
+    }
+
+    /// Back edge: r0 branches to r1, r1 jumps back to r0 — r1->r0 is a
+    /// back edge (r0 reaches r1), both regions cyclic.
+    fn two_region_cycle_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("a");
+        let r1 = f.add_region("b");
+        let c = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+        let br = f.add_cell(r0, Cell::new(r0, CellKind::Branch { then_r: r1, else_r: r1 }));
+        wire(&mut f, br, 0, c);
+        f.add_cell(r1, Cell::new(r1, CellKind::Jump { target: r0 }));
+        f
+    }
+
+    /// Two value cells, one consumed (ret), one dead. Also an unconsumed phi.
+    fn dead_cells_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let c0 = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(7) }));
+        let dead = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I64, val: ConstVal::I64(9) }));
+        let phi = f.add_cell(r0, Cell::new(r0, CellKind::Phi { joins: vec![r0] }));
+        wire(&mut f, phi, 0, c0);
+        let ret = f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        wire(&mut f, ret, 0, c0);
+        let _ = dead;
+        f
+    }
+
+    fn const_f64(v: f64) -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::F64, val: ConstVal::F64(v) }));
+        f.add_cell(r0, Cell::new(r0, CellKind::Ret));
+        f
+    }
+
+    /// A fabric with no terminator at all — ctrl-edge count 0, no crash.
+    fn no_terminator_fabric() -> Fabric {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I1, val: ConstVal::I1(false) }));
+        f
+    }
+
+    // =====================================================================
+    // Layer 1 — corpus totals vs EXPERIMENTS §9.2 (independent ground truth)
+    // =====================================================================
+
+    #[test]
+    fn corpus_totals_match_experiments_s92_fab1c() {
+        let a = run_corpus(10_000, 0xFAB1C);
+        assert_eq!(a.fabrics, 10_000, "every generated fabric must verify");
+        assert_eq!(a.gen_verify_fail, 0);
+        assert_eq!(a.cells_total, 255_446, "cells total must match EXPERIMENTS §9.2");
+        assert_eq!(a.phis, 15_333, "phi total must match EXPERIMENTS §9.2");
+    }
+
+    #[test]
+    fn corpus_totals_match_experiments_s92_d3ca5() {
+        let a = run_corpus(10_000, 0xD3CA5);
+        assert_eq!(a.fabrics, 10_000);
+        assert_eq!(a.cells_total, 255_198, "stability-run cells total must match §9.2");
+    }
+
+    #[test]
+    fn corpus_determinism_replays_identically() {
+        let a1 = run_corpus(500, 0xFAB1C);
+        let a2 = run_corpus(500, 0xFAB1C);
+        assert_eq!(a1.cells_total, a2.cells_total);
+        assert_eq!(a1.phis, a2.phis);
+        assert_eq!(a1.ctrl_edges_total, a2.ctrl_edges_total);
+        assert_eq!(a1.fabrics_cyclic, a2.fabrics_cyclic);
+    }
+
+    // =====================================================================
+    // Layer 2 — histogram / census invariants on a hand-built corpus
+    // =====================================================================
+
+    fn hand_corpus() -> Vec<Fabric> {
+        vec![
+            simple_fabric(2),
+            simple_fabric(5),
+            simple_fabric(12), // 11-20 bucket
+            simple_fabric(44), // >40 bucket
+            phi_at_head_fabric(),
+            branch_eq_targets_fabric(),
+            two_region_cycle_fabric(),
+            self_loop_fabric(),
+            no_terminator_fabric(),
+        ]
+    }
+
+    #[test]
+    fn histograms_sum_to_fabric_count() {
+        let a = audit_of(&hand_corpus());
+        let n = a.fabrics;
+        assert_eq!(n, 9);
+        for (name, sum) in [
+            ("cells_hist", a.cells_hist.values().sum::<u64>()),
+            ("regions_hist", a.regions_hist.values().sum::<u64>()),
+            ("ctrl_edges_hist", a.ctrl_edges_hist.values().sum::<u64>()),
+            ("phis_hist", a.phis_hist.values().sum::<u64>()),
+        ] {
+            assert_eq!(sum, n, "{} must account for every fabric exactly once", name);
+        }
+    }
+
+    #[test]
+    fn kind_census_sums_to_cells_total() {
+        let a = audit_of(&hand_corpus());
+        assert_eq!(
+            a.kind_count.values().sum::<u64>(),
+            a.cells_total,
+            "cell-kind census must account for every cell"
+        );
+        assert_eq!(a.cells_min, 1); // no_terminator fabric: 1 cell
+        assert!(a.cells_max >= 13); // simple_fabric(12) + ret
+    }
+
+    #[test]
+    fn ctrl_edge_multiplicity_counted() {
+        // branch = 2 edges (even when targets are equal), jump = 1, ret = 0
+        let a = audit_of(&[branch_eq_targets_fabric(), two_region_cycle_fabric()]);
+        // branch_eq: br(then=else) = 2 edges; cycle: br = 2 + jump = 1 => 3; total 5
+        assert_eq!(a.ctrl_edges_total, 5);
+    }
+
+    // =====================================================================
+    // Layer 3 — cannot-emit detectors on synthetic fixtures
+    // =====================================================================
+
+    #[test]
+    fn detector_self_loop() {
+        let a = audit_of(&[self_loop_fabric()]);
+        assert_eq!(a.self_loops, 1);
+        assert_eq!(a.fabrics_self_loop, 1);
+        assert_eq!(a.fabrics_cyclic, 1);
+        assert_eq!(a.cyclic_regions, 1);
+    }
+
+    #[test]
+    fn detector_back_edge_two_region_cycle() {
+        let a = audit_of(&[two_region_cycle_fabric()]);
+        // Definition: edge u->v is back iff v reaches u. In a 2-region
+        // cycle each region reaches the other, so ALL 3 edges qualify:
+        // 2x (r0->r1: r1 jumps to r0) + 1x (r1->r0: r0 branches to r1).
+        assert_eq!(a.back_edges, 3);
+        assert_eq!(a.fabrics_cyclic, 1);
+        assert_eq!(a.cyclic_regions, 2, "both regions lie on the cycle");
+        assert_eq!(a.fabrics_cycle_from_entry, 1, "cycle starts at entry");
+        assert_eq!(a.self_loops, 0);
+    }
+
+    #[test]
+    fn detector_unreachable_region() {
+        let a = audit_of(&[unreachable_region_fabric()]);
+        assert_eq!(a.unreachable_regions, 1);
+        assert_eq!(a.fabrics_with_unreachable, 1);
+        assert_eq!(a.fabrics_cycle_from_entry, 0);
+    }
+
+    #[test]
+    fn detector_branch_equal_targets() {
+        let a = audit_of(&[branch_eq_targets_fabric()]);
+        assert_eq!(a.branch_eq_targets, 1);
+        // equal targets still count as 2 ctrl edges (multiplicity)
+        assert_eq!(a.ctrl_edges_total, 2);
+        assert_eq!(a.unique_edges_total, 1);
+    }
+
+    #[test]
+    fn detector_div_const_zero_rhs() {
+        let a = audit_of(&[div_const_zero_fabric()]);
+        assert_eq!(a.arith_div_const_zero_rhs, 1);
+        let clean = audit_of(&[dup_operand_fabric()]);
+        assert_eq!(clean.arith_div_const_zero_rhs, 0);
+    }
+
+    #[test]
+    fn detector_duplicate_arith_operands() {
+        let a = audit_of(&[dup_operand_fabric()]);
+        assert_eq!(a.arith_dup_operands, 1);
+    }
+
+    #[test]
+    fn detector_phi_head_position() {
+        let a = audit_of(&[phi_at_head_fabric()]);
+        assert_eq!(a.phi_at_head, 1);
+        assert_eq!(a.phi_not_at_head, 0);
+        let b = audit_of(&[phi_not_at_head_fabric()]);
+        assert_eq!(b.phi_at_head, 0);
+        assert_eq!(b.phi_not_at_head, 1);
+    }
+
+    #[test]
+    fn detector_phi_in_entry_region() {
+        let a = audit_of(&[phi_at_head_fabric()]);
+        assert_eq!(a.phi_in_entry, 1);
+        assert_eq!(a.phis, 1);
+        assert_eq!(a.phi_join_size.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn detector_dead_and_unconsumed() {
+        let a = audit_of(&[dead_cells_fabric()]);
+        // consts c0 (consumed by phi + ret), dead i64, unconsumed phi
+        assert_eq!(a.value_cells, 3);
+        assert_eq!(a.dead_value_cells, 2); // dead i64 const + unconsumed phi
+        assert_eq!(a.phi_unconsumed, 1);
+    }
+
+    #[test]
+    fn detector_f64_eighth_multiples() {
+        let a = audit_of(&[const_f64(0.125)]);
+        assert_eq!(a.f64_non_eighth, 0, "0.125 is a multiple of 1/8");
+        let b = audit_of(&[const_f64(0.3)]);
+        assert_eq!(b.f64_non_eighth, 1, "0.3 is not a multiple of 1/8");
+    }
+
+    #[test]
+    fn detector_ret_void_vs_value() {
+        let a = audit_of(&[simple_fabric(2)]);
+        assert_eq!(a.ret_void, 1);
+        assert_eq!(a.ret_with_value, 0);
+        let b = audit_of(&[div_const_zero_fabric()]);
+        assert_eq!(b.ret_with_value, 1);
+        assert_eq!(b.ret_void, 0);
+        assert_eq!(b.ret_value_from_phi, 0);
+        // ret(phi) counts as value-from-phi
+        let c = audit_of(&[phi_at_head_fabric()]);
+        assert_eq!(c.ret_value_from_phi, 1);
+    }
+
+    #[test]
+    fn detector_acyclic_fabric_silent() {
+        // All-negative control: simple fabric must fire NOTHING.
+        let a = audit_of(&[simple_fabric(3), branch_eq_targets_fabric()]);
+        // remove the branch-eq fabric's contribution by auditing it alone:
+        let b = audit_of(&[branch_eq_targets_fabric()]);
+        let a_minus_b_self = a.self_loops - b.self_loops;
+        assert_eq!(a_minus_b_self, 0);
+        let clean = audit_of(&[simple_fabric(3)]);
+        assert_eq!(clean.self_loops, 0);
+        assert_eq!(clean.back_edges, 0);
+        assert_eq!(clean.fabrics_cyclic, 0);
+        assert_eq!(clean.unreachable_regions, 0);
+        assert_eq!(clean.phi_partial_coverage, 0);
+        assert_eq!(clean.branch_eq_targets, 0);
+        assert_eq!(clean.arith_dup_operands, 0);
+        assert_eq!(clean.arith_div_const_zero_rhs, 0);
+    }
+
+    #[test]
+    fn detector_phi_partial_coverage() {
+        // phi in r1 whose joins do not match r1's predecessors:
+        // r0 branches to r1 (pred = [r0] twice -> predecessors dedup?),
+        // phi joins [r1] (wrong region) => mismatch => detector fires.
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("entry");
+        let r1 = f.add_region("join");
+        let c = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+        let br = f.add_cell(r0, Cell::new(r0, CellKind::Branch { then_r: r1, else_r: r1 }));
+        wire(&mut f, br, 0, c);
+        let phi = f.add_cell(r1, Cell::new(r1, CellKind::Phi { joins: vec![r0] }));
+        wire(&mut f, phi, 0, c);
+        let ret = f.add_cell(r1, Cell::new(r1, CellKind::Ret));
+        wire(&mut f, ret, 0, phi);
+        let a = audit_of(&[f]);
+        // joins == [r0], preds of r1 = {r0} => sizes match, set covered:
+        // should NOT fire. Now build the firing variant:
+        let mut g = Fabric::empty();
+        let r0 = g.add_region("entry");
+        let r1 = g.add_region("join");
+        let c = g.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+        let br = g.add_cell(r0, Cell::new(r0, CellKind::Branch { then_r: r1, else_r: r1 }));
+        wire(&mut g, br, 0, c);
+        let phi = g.add_cell(r1, Cell::new(r1, CellKind::Phi { joins: vec![r1] }));
+        wire(&mut g, phi, 0, c);
+        let ret = g.add_cell(r1, Cell::new(r1, CellKind::Ret));
+        wire(&mut g, ret, 0, phi);
+        let b = audit_of(&[g]);
+        assert_eq!(a.phi_partial_coverage, 0, "exact pred coverage must not fire");
+        assert_eq!(b.phi_partial_coverage, 1, "join region not a predecessor must fire");
+    }
+}
