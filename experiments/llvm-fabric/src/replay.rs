@@ -27,7 +27,7 @@ pub fn apply_edit(f: &mut Fabric, e: &Edit) -> Result<(), String> {
             place(f, *id, *index, cell.clone())?;
             Ok(())
         }
-        Edit::RemoveCell { id, .. } => {
+        Edit::RemoveCell { id, ledger, .. } => {
             let cell = f.cell(*id).ok_or_else(|| format!("RemoveCell {}: no such cell present", id))?;
             let region = cell.region;
             let cells = &mut f.regions[region.0 as usize].cells;
@@ -37,6 +37,14 @@ pub fn apply_edit(f: &mut Fabric, e: &Edit) -> Result<(), String> {
                 .ok_or_else(|| format!("RemoveCell {}: not listed in its region", id))?;
             cells.remove(pos);
             f.slab[id.0 as usize] = None;
+            // M4.1 (tit-quilt retrofit): a parseable death certificate
+            // carries a tombstone — the ledger line IS the graveyard's
+            // carrier, so replay rebuilds it bit-identically from the
+            // ledger alone. Non-certificate removals (constfold folds,
+            // the old dce prose) tombstone nothing.
+            if let Some(cert) = crate::decay::DeathCert::parse(ledger, *id) {
+                f.tombstones.push(cert.tombstone());
+            }
             Ok(())
         }
         Edit::Retarget { cell, slot, from, to } => {

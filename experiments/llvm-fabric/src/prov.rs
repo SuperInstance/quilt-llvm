@@ -7,6 +7,12 @@
 //!   claim otherwise;
 //! - provenance of a DEAD value, and per-cell transform history, are
 //!   things textual LLVM IR and llvm::Value do not carry at all.
+//!
+//! M4.1 (tit-quilt retrofit): the walk resolves THROUGH TOMBSTONES. A
+//! forgotten cell renders as its hash-only record (`<forgotten …>`)
+//! and the walk continues down the tombstone's witness list — the
+//! provenance-integrity law: nothing witness-referenced is ever
+//! destroyed, so no walk ever dead-ends at a decay kill.
 
 use crate::cell::CellKind;
 use crate::diff::History;
@@ -21,21 +27,42 @@ pub struct ProvNode {
 }
 
 /// Walk the def chain of `target`. Every leaf is a param or a const (the
-/// fabric's roots). Cycles are impossible in a verified fabric but are
-/// detected anyway (defense in depth: Err, not a hang).
+/// fabric's roots) — a tombstoned param/const is an equally good leaf.
+/// Cycles are impossible in a verified fabric but are detected anyway
+/// (defense in depth: Err, not a hang).
 pub fn provenance(f: &Fabric, target: CellId) -> Result<ProvNode, String> {
     let mut visiting: Vec<CellId> = vec![];
     walk(f, target, &mut visiting, 0)
 }
 
 fn walk(f: &Fabric, id: CellId, visiting: &mut Vec<CellId>, depth: u32) -> Result<ProvNode, String> {
-    let c = f.cell(id).ok_or_else(|| format!("no such cell {}", id))?;
     if depth > 100_000 {
         return Err(format!("provenance depth guard at {}", id));
     }
     if visiting.contains(&id) {
         return Err(format!("cycle in provenance through {}", id));
     }
+    if f.cell(id).is_none() {
+        // M4.1: the graveyard answers before the walk dead-ends
+        if let Some(tb) = f.tombstone_of(id) {
+            visiting.push(id);
+            let mut children = vec![];
+            for &w in &tb.witness {
+                children.push(walk(f, w, visiting, depth + 1)?);
+            }
+            visiting.pop();
+            return Ok(ProvNode {
+                id,
+                line: format!(
+                    "{} = {} <forgotten tick={} vhash={:#018x}>",
+                    tb.cell, tb.kind, tb.tick, tb.vhash
+                ),
+                children,
+            });
+        }
+        return Err(format!("no such cell {}", id));
+    }
+    let c = f.cell(id).expect("just checked");
     let line = crate::text::render_cell(f, id);
     match &c.kind {
         CellKind::Param { .. } | CellKind::Const { .. } => Ok(ProvNode { id, line, children: vec![] }),
@@ -74,32 +101,40 @@ fn render_into(node: &ProvNode, depth: usize, out: &mut String) {
 /// (no invented cells).
 pub fn check_prov(f: &Fabric, id: CellId) -> Result<(), String> {
     let node = provenance(f, id)?;
-    let n_cells = f.cells().count();
+    let n_cells = f.cells().count() + f.tombstones.len();
     let mut leaves_ok = true;
     let mut count = 0usize;
     // The walk ROOT may itself be a terminator with no data wires (e.g. a
     // bare jump): its provenance is legitimately empty. Only nodes BELOW
-    // the root must be value cells ending at param/const roots.
+    // the root must be value cells ending at param/const roots. M4.1: a
+    // tombstoned leaf is an equally good root iff it is a root KIND with
+    // an empty witness list (a forgotten const/param).
     let mut stack: Vec<&ProvNode> = node.children.iter().collect();
     count += 1;
-    if f.cell(node.id).is_none() {
+    if f.cell(node.id).is_none() && f.tombstone_of(node.id).is_none() {
         return Err(format!("provenance invented cell {}", node.id));
     }
     while let Some(n) = stack.pop() {
         count += 1;
+        let tombed = f.tombstone_of(n.id);
+        if f.cell(n.id).is_none() && tombed.is_none() {
+            return Err(format!("provenance invented cell {}", n.id));
+        }
         if n.children.is_empty() {
-            let is_root = f
-                .cell(n.id)
-                .map(|c| matches!(c.kind, CellKind::Param { .. } | CellKind::Const { .. }))
-                .unwrap_or(false);
+            let is_root = match (&f.cell(n.id), &tombed) {
+                (Some(c), _) => matches!(c.kind, CellKind::Param { .. } | CellKind::Const { .. }),
+                (None, Some(tb)) => {
+                    tb.witness.is_empty() && (tb.kind == "param" || tb.kind == "const")
+                }
+                (None, None) => false,
+            };
             if !is_root {
                 leaves_ok = false;
             }
-        } else if f.cell(n.id).map(|c| c.produces_value()) != Some(true) {
-            return Err(format!("non-value cell {} inside provenance tree", n.id));
-        }
-        if f.cell(n.id).is_none() {
-            return Err(format!("provenance invented cell {}", n.id));
+        } else if let Some(c) = f.cell(n.id) {
+            if !c.produces_value() {
+                return Err(format!("non-value cell {} inside provenance tree", n.id));
+            }
         }
         stack.extend(n.children.iter());
     }
@@ -228,5 +263,83 @@ region join\n\
         let node = provenance(&f, CellId(3)).unwrap();
         assert_eq!(node.children.len(), 2);
         assert!(check_prov(&f, CellId(3)).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod tombstone_walk_tests {
+    //! M4.1 — provenance resolves through the graveyard (tit-quilt
+    //! retrofit): a forgotten cell's walk renders its hash-only record
+    //! and follows the tombstone witness list to the roots.
+
+    use super::*;
+    use crate::cell::{ArithOp, Cell, CellKind};
+    use crate::decay::{dce_decay, DeathCert};
+    use crate::manager::TickCtx;
+    use crate::ty::{ConstVal, Type};
+
+    /// entry: %0=param ; %1=arith.add %0,%0 ; %2=ret %1 ; then a dead
+    /// island: %3=const i32 7 ; %4=arith.add %3,%0 (no users, not
+    /// foldable — only decay can kill it)
+    fn dead_island() -> (Fabric, CellId, CellId, CellId) {
+        let mut f = Fabric::empty();
+        let e = f.add_region("entry");
+        let p = f.add_cell(e, Cell::new(e, CellKind::Param { ty: Type::I32 }));
+        let mut live = Cell::new(e, CellKind::Arith { op: ArithOp::Add, ty: Type::I32 });
+        live.operands = vec![p, p];
+        let live = f.add_cell(e, live);
+        let d1 = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I32, val: ConstVal::I32(7) }));
+        let mut da = Cell::new(e, CellKind::Arith { op: ArithOp::Add, ty: Type::I32 });
+        da.operands = vec![d1, p];
+        let da = f.add_cell(e, da);
+        let mut r = Cell::new(e, CellKind::Ret);
+        r.operands = vec![live];
+        f.add_cell(e, r);
+        (f, p, d1, da)
+    }
+
+    #[test]
+    fn green_provenance_of_a_forgotten_value_resolves_through_tombstones() {
+        let (f, p, d1, da) = dead_island();
+        let (g, _rec) = dce_decay(&f, &TickCtx { tick: 1 }).expect("decay");
+        assert!(g.cell(da).is_none(), "the add is gone from the slab");
+        // pre-M4.1 this walk dead-ended ("no such cell")
+        let node = provenance(&g, da).expect("the graveyard answers");
+        let text = render(&node);
+        assert!(
+            text.contains("<forgotten tick=1"),
+            "the tombstone record renders: {}",
+            text
+        );
+        assert!(text.contains("arith"), "{}", text);
+        // the walk follows the witness list: the dead const (itself a
+        // tombstone) and the LIVE param both appear
+        assert!(text.contains("const"), "{}", text);
+        assert!(text.contains("param i32"), "{}", text);
+        assert_eq!(node.children.len(), 2, "witness = [dead const, live param]");
+        assert!(check_prov(&g, da).is_ok(), "leaves are roots, live or tombstoned");
+        // the const's tombstone is a leaf: hash-only, no children
+        let cn = provenance(&g, d1).expect("const tombstone");
+        assert!(cn.children.is_empty());
+        assert!(cn.line.contains("<forgotten"), "{}", cn.line);
+        let _ = p;
+    }
+
+    #[test]
+    fn green_certificates_and_graveyard_agree() {
+        // the tombstone's hash IS the certificate's hash: the ledger line,
+        // the graveyard, and the pre-tick fabric all describe one cell
+        let (f, _p, d1, da) = dead_island();
+        let (g, rec) = dce_decay(&f, &TickCtx { tick: 0 }).expect("decay");
+        for e in &rec.edits {
+            if let crate::diff::Edit::RemoveCell { id, ledger, .. } = e {
+                let cert = DeathCert::parse(ledger, *id).expect("certified");
+                let tb = g.tombstone_of(*id).expect("tombstoned");
+                assert_eq!(cert.vhash, tb.vhash, "ledger and graveyard agree");
+                assert_eq!(cert.witness, tb.witness);
+                assert_eq!(cert.vhash, crate::sign::fnv1a64(crate::text::render_cell(&f, *id).as_bytes()));
+            }
+        }
+        let _ = (d1, da);
     }
 }

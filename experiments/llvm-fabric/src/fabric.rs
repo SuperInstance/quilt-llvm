@@ -1,8 +1,16 @@
 //! The fabric: regions of cells, wires as use edges, slab storage with
 //! stable ids. Ids are never reused; removed cells leave `None` holes
 //! (N4: history appends, ids persist).
+//!
+//! The graveyard (M4.1, tit-quilt retrofit): `tombstones` carries a
+//! hash-only record of every FORGOTTEN cell — append-only, never
+//! pruned, never deleted (the provenance-integrity law). A tombstone
+//! and its cell never coexist: forgetting removes from the slab and
+//! leaves the tombstone; the slab hole and the tombstone are the same
+//! event seen from the two sides.
 
 use crate::cell::{Cell, CellKind};
+use crate::decay::Tombstone;
 use crate::id::{CellId, RegionId};
 
 #[derive(Clone, PartialEq, Debug)]
@@ -26,6 +34,12 @@ pub struct Fabric {
     pub regions: Vec<Region>,
     /// Cell slab. `None` = removed (or not yet assigned). Index = CellId.
     pub slab: Vec<Option<Cell>>,
+    /// The graveyard: hash-only tombstones of FORGOTTEN cells
+    /// (tit-quilt's provenance-integrity law retrofitted; see decay.rs).
+    /// NOT part of `text::print` — the fabric signature observes the
+    /// live fabric; tombstone integrity is audited by `verify_deaths`
+    /// recomputation and the V18/V19 verifier laws.
+    pub tombstones: Vec<Tombstone>,
 }
 
 impl Fabric {
@@ -91,6 +105,51 @@ impl Fabric {
 
     pub fn cell(&self, id: CellId) -> Option<&Cell> {
         self.slab.get(id.0 as usize).and_then(|c| c.as_ref())
+    }
+
+    /// The tombstone of a forgotten cell, if any. Like tit-quilt's
+    /// `tombstone_by_id`: last record wins (idempotent forget means at
+    /// most one exists — V19 enforces it).
+    pub fn tombstone_of(&self, id: CellId) -> Option<&Tombstone> {
+        self.tombstones.iter().rev().find(|t| t.cell == id)
+    }
+
+    /// FORGET — the tit-quilt law, retrofitted: never delete, tombstone.
+    /// Removes `id` from the slab (leaving its hole) and appends the
+    /// tombstone carried by `cert`. The certificate must MATCH the cell
+    /// it forgets (content hash), a fresh forget must find the cell
+    /// present, and re-forgetting is idempotent (the existing tombstone
+    /// stands; no duplicate is appended). There is no delete path.
+    pub fn forget(&mut self, cert: &crate::decay::DeathCert) -> Result<(), String> {
+        if self.tombstone_of(cert.cell).is_some() {
+            return Ok(()); // idempotent: the record stands, nothing appended
+        }
+        let cell = self
+            .cell(cert.cell)
+            .ok_or_else(|| format!("forget {}: no such cell (and no tombstone)", cert.cell))?;
+        let want = crate::sign::fnv1a64(crate::text::render_cell(self, cert.cell).as_bytes());
+        if want != cert.vhash {
+            return Err(format!(
+                "forget {} rejected: certificate hash {:016x} does not match the cell ({:016x}) — the certificate does not describe this cell",
+                cert.cell, cert.vhash, want
+            ));
+        }
+        if cell.operands != cert.witness {
+            return Err(format!(
+                "forget {} rejected: certificate witness list does not match the cell's operands",
+                cert.cell
+            ));
+        }
+        let region = cell.region;
+        let cells = &mut self.regions[region.0 as usize].cells;
+        let pos = cells
+            .iter()
+            .position(|&c| c == cert.cell)
+            .ok_or_else(|| format!("forget {}: not listed in its region", cert.cell))?;
+        cells.remove(pos);
+        self.slab[cert.cell.0 as usize] = None;
+        self.tombstones.push(cert.tombstone());
+        Ok(())
     }
 
     pub fn cell_mut(&mut self, id: CellId) -> Option<&mut Cell> {
