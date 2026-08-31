@@ -26,3 +26,4 @@ pub mod manager;
 pub mod decay;
 pub mod semmut;
 pub mod bench;
+pub mod ga;
