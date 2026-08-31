@@ -84,7 +84,7 @@ pub fn reachable_regions(f: &Fabric) -> BTreeSet<u32> {
     let mut work = vec![entry];
     seen.insert(entry.0);
     while let Some(r) = work.pop() {
-        for s in f.successors(r) {
+        for &s in f.successors(r) {
             if seen.insert(s.0) {
                 work.push(s);
             }
@@ -121,7 +121,7 @@ pub fn region_remove(f: &Fabric, r: RegionId) -> Result<(Fabric, DiffRecord), St
         if from == r {
             continue;
         }
-        for s in f.successors(from) {
+        for &s in f.successors(from) {
             if s == r {
                 return Err(format!(
                     "region_remove: '{}' still targets '{}' — strip the edge first",
@@ -240,7 +240,7 @@ fn strip_src_joins(
             None => continue,
         };
         let pos = joins.iter().position(|&j| j == src).expect("filtered");
-        let users: Vec<(CellId, u32)> = g.uses_of(phi);
+        let users: Vec<(CellId, u32)> = g.uses_of(phi).to_vec();
         let summary = crate::text::render_cell(g, phi);
 
         if joins.len() == 1 {
@@ -469,7 +469,7 @@ pub fn join_phi(
     let mut g = f.clone();
     let mut rec = DiffRecord::new("join-phi");
     let index = g.index_in_region(phi).expect("listed");
-    let users: Vec<(CellId, u32)> = g.uses_of(phi);
+    let users: Vec<(CellId, u32)> = g.uses_of(phi).to_vec();
     let summary = crate::text::render_cell(&g, phi);
     let e = Edit::RemoveCell {
         id: phi,
@@ -1390,7 +1390,8 @@ fn inline_one(
 
     // 7. relabel joins on the OLD entry-successors: the moved
     //    terminator carries the same edges from K now (V06/V16 exact)
-    for s in h.successors(k) {
+    let succs_k: Vec<RegionId> = h.successors(k).to_vec();
+    for &s in succs_k.iter() {
         let phi_ids: Vec<CellId> = h
             .region(s)
             .map(|x| x.cells.clone())
@@ -1450,7 +1451,8 @@ fn inline_one(
 
     // 9. retarget uses of the call to the return value; the call cell
     //    leaves with a conservation ledger entry
-    for (u, slot) in h.uses_of(call_id) {
+    let uses_call: Vec<(CellId, u32)> = h.uses_of(call_id).to_vec();
+    for &(u, slot) in uses_call.iter() {
         let c = h.cell_mut(u).expect("present");
         let from = c.operands[slot as usize];
         c.operands[slot as usize] = ret_val;

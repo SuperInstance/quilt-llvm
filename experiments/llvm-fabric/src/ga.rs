@@ -780,6 +780,14 @@ pub struct RunReport {
 }
 
 pub fn run(cfg: &GaConfig) -> RunReport {
+    run_inner(cfg).0
+}
+
+pub fn run_keep(cfg: &GaConfig) -> (RunReport, Vec<Fabric>) {
+    run_inner(cfg)
+}
+
+fn run_inner(cfg: &GaConfig) -> (RunReport, Vec<Fabric>) {
     let mut rng = Rng::new(cfg.seed);
     // initialize: seed population from the corpus generator itself —
     // the GA starts exactly where the audit's blind spot begins
@@ -871,7 +879,8 @@ pub fn run(cfg: &GaConfig) -> RunReport {
         coverage(&population[bi])
     };
 
-    RunReport { gens, first_covered, max_item_counts, best_coverage, best_fitness, total_evals }
+    let rep = RunReport { gens, first_covered, max_item_counts, best_coverage, best_fitness, total_evals };
+    (rep, population)
 }
 
 #[cfg(test)]
