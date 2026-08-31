@@ -20,12 +20,13 @@ fn main() {
         "prov" => cmd_prov(&args[2..]),
         "replay" => cmd_replay(&args[2..]),
         "inline" => cmd_inline(&args[2..]),
+        "semmut" => cmd_semmut(&args[2..]),
         "bench" => {
             println!("{}", llvm_fabric::bench::bench());
         }
         _ => {
             eprintln!(
-                "usage: llvm-fabric <version|print FILE|verify FILE|fuzz [--iters N] [--seed S]|pipeline FILE|prov FILE CELL|replay FILE|manager FILE [PASSES...]|decay-curve [--iters N]|bench>"
+                "usage: llvm-fabric <version|print FILE|verify FILE|fuzz [--iters N] [--seed S]|pipeline FILE|prov FILE CELL|replay FILE|manager FILE [PASSES...]|decay-curve [--iters N]|semmut [--iters N] [--seed S]|bench>"
             );
             exit(2);
         }
@@ -310,6 +311,43 @@ fn cmd_inline(args: &[String]) {
         }
         Err(e) => {
             eprintln!("pipeline failed: {}", e);
+            exit(1);
+        }
+    }
+}
+
+fn cmd_semmut(args: &[String]) {
+    // R1 lane 3: the semantic mutation tier — structurally valid,
+    // semantically wrong fabrics + the tamper control, judged by the
+    // full battery. Kill rates per kind are printed; the published
+    // table lives in docs/phase/SEM-MUTANTS.md.
+    let mut iters: u64 = 2_000;
+    let mut seed: u64 = 0x5EED;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--iters" => {
+                i += 1;
+                iters = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("--iters needs a number"));
+            }
+            "--seed" => {
+                i += 1;
+                seed = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("--seed needs a number"));
+            }
+            other => panic!("unknown semmut arg {}", other),
+        }
+        i += 1;
+    }
+    match llvm_fabric::semmut::semmut_run(iters, seed) {
+        Ok(r) => print!("{}", r),
+        Err(e) => {
+            eprintln!("semantic battery invariant violated: {}", e);
             exit(1);
         }
     }

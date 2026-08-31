@@ -1,0 +1,21 @@
+id	kind	section	file	judge_suite	tests_failed_suite	killed_by_suite	judge_suite_oracle	tests_failed_oracle	oracle_marginal
+fold-add-i32-xy1	fold-result-flip	S2	src/passes/constfold.rs	KILL	5	passes::constfold::tests::folds_inside_phi_operands_stay_in_scope|passes::constfold::tests::green_folds_add_and_cascades|pipeline::tests::pipeline_conserves_and_verifies|pipeline::v1_tests::v1_pipeline_folds_through_the_inline_boundary|prov::tests::history_provenance_tracks_dropped_cells	KILL	6	no
+fold-add-i64-xy1	fold-result-flip	S2	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-sub-i32-swap	operand-swap	S2	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-mul-i32-add	fold-result-flip	S2	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-div-i32-mul	fold-result-flip	S2	src/passes/constfold.rs	KILL	1	passes::constfold::tests::div_by_zero_const_is_left_alone	KILL	2	no
+fold-cmp-lt-i32-le	fold-result-flip	S2	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-cmp-ge-i64-gt	fold-result-flip	S2	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+inline-args-reversed	arg-binding-swap	S2	src/passes/inline.rs	KILL	1	passes::inline::tests::green_inlines_straight_line_call	KILL	1	no
+decay-liveness-skip-first	liveness-skip	S2	src/decay.rs	KILL	6	decay::tests::bogus_kill_of_a_live_cell_is_rejected_naming_the_demand_chain|decay::tests::classification_dead_cold_warm_is_measured_not_vibes|decay::tests::curve_invariants_hold_on_a_small_corpus|decay::tests::decay_pipeline_runs_through_the_manager_with_every_death_certified|decay::tests::green_decay_kill_carries_a_certificate_that_verifies|decay::tests::red_no_decay_is_identity_with_empty_diff	KILL	6	no
+fold-add-f64-xy1	fold-result-flip	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-sub-i64-swap	operand-swap	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-mul-i64-add	fold-result-flip	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-div-i64-mul	fold-result-flip	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-div-f64-mul	fold-result-flip	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-cmp-lt-f64-le	fold-result-flip	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-cmp-eq-i32-flip	fold-result-flip	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-add-i32-offbyone	off-by-one	EXT	src/passes/constfold.rs	KILL	5	passes::constfold::tests::folds_inside_phi_operands_stay_in_scope|passes::constfold::tests::green_folds_add_and_cascades|pipeline::tests::pipeline_conserves_and_verifies|pipeline::v1_tests::v1_pipeline_folds_through_the_inline_boundary|prov::tests::history_provenance_tracks_dropped_cells	KILL	6	no
+fold-add-i64-offbyone	off-by-one	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+fold-div-i32-offbyone	off-by-one	EXT	src/passes/constfold.rs	SURVIVE	0		KILL	1	yes
+inline-noncomm-swap	noncomm-reorder	EXT	src/passes/inline.rs	SURVIVE	0		SURVIVE	0	no
