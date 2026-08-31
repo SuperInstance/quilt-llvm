@@ -25,4 +25,5 @@ pub mod pipeline;
 pub mod manager;
 pub mod decay;
 pub mod semmut;
+pub mod ga;
 pub mod bench;
