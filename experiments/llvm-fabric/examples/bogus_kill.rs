@@ -1,9 +1,12 @@
-//! M4 proof-of-rejection: forge a death certificate for a LIVE cell and
-//! watch the verifier reject it, naming the demand chain.
+//! M4/M4.1 proof-of-rejection: forge a COMPLETE tombstone-bearing
+//! death certificate for a LIVE cell — every field measured and
+//! correct — and watch the verifier reject it anyway, naming the
+//! demand chain. The tombstone body (tit-quilt retrofit) does not
+//! launder a forged FORGET.
 //!
 //! Run: cargo run --release --example bogus_kill
-//! Exit code 0 = the bogus kill WAS rejected (expected); 1 = it slipped
-//! through (would be an M4 failure).
+//! Exit code 0 = the forged FORGET WAS rejected (expected); 1 = it
+//! slipped through (would be an M4 failure).
 
 use llvm_fabric::cell::{ArithOp, Cell, CellKind};
 use llvm_fabric::decay::{dce_decay, verify_deaths, DeathCert};
@@ -26,18 +29,20 @@ fn main() {
     f.add_cell(e, r);
 
     // run a real decay tick (fixed point — nothing dead), then FORGE a
-    // certificate for the live const %1 with a correct user count
+    // complete tombstone for the live const %1: hash, kind, witness,
+    // users — all measured, all correct. Only the death is a lie.
     let (_, mut rec) = dce_decay(&f, &TickCtx { tick: 0 }).expect("decay tick");
+    let forged = DeathCert::measure(&f, c1, "dce-decay", 0).expect("live cell is measurable");
     rec.edits.push(Edit::RemoveCell {
         id: c1,
-        ledger: DeathCert { cell: c1, killer: "dce-decay".into(), tick: 0, users: 1 }.render(),
+        ledger: forged.render(),
         summary: "%1 = const i32 20".into(),
     });
 
-    println!("forged ledger entry: {}", rec.edits[0].match_ledger());
+    println!("forged FORGET ledger entry: {}", rec.edits[0].match_ledger());
     match verify_deaths(&f, &rec) {
         Ok(()) => {
-            println!("NOT REJECTED — M4 FAILURE: a bogus kill passed as a certified death");
+            println!("NOT REJECTED — M4 FAILURE: a forged FORGET passed as a certified death");
             std::process::exit(1);
         }
         Err(e) => {

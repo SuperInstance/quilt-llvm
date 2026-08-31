@@ -381,6 +381,30 @@ pub fn verify(f: &Fabric) -> Result<(), VerifyError> {
         }
     }
 
+    // V18/V19: the tombstone laws (M4.1, tit-quilt retrofit — the
+    // provenance-integrity law as verifier codes). A forget REMOVES:
+    // a tombstone for a cell still in the slab is a forged FORGET of a
+    // live-or-present cell. And forget is idempotent: two tombstones
+    // for one cell is a forged graveyard.
+    let mut tombed: std::collections::BTreeSet<CellId> = std::collections::BTreeSet::new();
+    for tb in &f.tombstones {
+        if f.cell(tb.cell).is_some() {
+            return Err(fail(
+                "V18",
+                format!(
+                    "tombstone {} exists but the cell is still present — a forged FORGET (forgetting removes; it never deletes)",
+                    tb.cell
+                ),
+            ));
+        }
+        if !tombed.insert(tb.cell) {
+            return Err(fail(
+                "V19",
+                format!("duplicate tombstone {} — forget is idempotent; one cell, one tombstone", tb.cell),
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -868,5 +892,80 @@ mod v17_tests {
         f.add_cell(r1, c);
         f.add_cell(r1, Cell::new(r1, CellKind::Jump { target: r0 }));
         assert_eq!(code_of(&f), "V17");
+    }
+}
+
+#[cfg(test)]
+mod tombstone_tests {
+    //! V18/V19 — the graveyard laws (M4.1, tit-quilt retrofit).
+
+    use super::*;
+    use crate::cell::{ArithOp, Cell, CellKind};
+    use crate::decay::{DeathCert, Tombstone};
+    use crate::id::CellId;
+    use crate::ty::{ConstVal, Type};
+
+    /// entry: %0=param ; %1=const i64 7 (dead) ; %2=arith.add %0,%0 ; %3=ret %2
+    fn with_dead() -> (Fabric, CellId) {
+        let mut f = Fabric::empty();
+        let e = f.add_region("entry");
+        let p = f.add_cell(e, Cell::new(e, CellKind::Param { ty: Type::I32 }));
+        let dead = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I64, val: ConstVal::I64(7) }));
+        let mut a = Cell::new(e, CellKind::Arith { op: ArithOp::Add, ty: Type::I32 });
+        a.operands = vec![p, p];
+        let a = f.add_cell(e, a);
+        let mut r = Cell::new(e, CellKind::Ret);
+        r.operands = vec![a];
+        f.add_cell(e, r);
+        (f, dead)
+    }
+
+    #[test]
+    fn red_v18_tombstone_for_a_present_cell_is_a_forged_forget() {
+        let (mut f, dead) = with_dead();
+        assert!(verify(&f).is_ok());
+        // forge: tombstone the dead const WITHOUT removing it — the
+        // graveyard claims a forget the fabric never performed
+        let cert = DeathCert::measure(&f, dead, "dce-decay", 0).expect("present");
+        f.tombstones.push(Tombstone {
+            cell: dead,
+            kind: "const".into(),
+            killer: "dce-decay".into(),
+            tick: 0,
+            vhash: cert.vhash,
+            witness: vec![],
+        });
+        let err = verify(&f).expect_err("a tombstone for a present cell must fail");
+        assert_eq!(err.code, "V18");
+        assert!(err.detail.contains("forged FORGET"), "{}", err);
+        // the honest state — forget via the law path — verifies
+        let mut g = f;
+        g.tombstones.clear();
+        g.forget(&cert).expect("lawful forget");
+        assert!(verify(&g).is_ok());
+        assert!(g.cell(dead).is_none());
+    }
+
+    #[test]
+    fn red_v19_duplicate_tombstones_are_a_forged_graveyard() {
+        let (f, dead) = with_dead();
+        let cert = DeathCert::measure(&f, dead, "dce-decay", 0).expect("present");
+        let mut g = f;
+        g.forget(&cert).expect("lawful forget");
+        assert!(verify(&g).is_ok());
+        // forge: append a second tombstone for the same cell
+        g.tombstones.push(cert.tombstone());
+        let err = verify(&g).expect_err("two tombstones for one cell must fail");
+        assert_eq!(err.code, "V19");
+        assert!(err.detail.contains("idempotent"), "{}", err);
+    }
+
+    #[test]
+    fn green_an_empty_graveyard_changes_nothing() {
+        // every pre-M4.1 fabric (all corpus inputs, all v0 shapes)
+        // carries an empty graveyard and must keep verifying
+        let (f, _dead) = with_dead();
+        assert_eq!(f.tombstones.len(), 0);
+        assert!(verify(&f).is_ok());
     }
 }

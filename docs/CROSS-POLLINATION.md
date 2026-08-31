@@ -72,6 +72,11 @@ corruption bug; needs a cross-impl fixture suite before any root is trusted.
 
 ### 2. tit-quilt tombstones × M4 DCE-as-decay (both)
 
+**Status update 2026-08-30: the IN half of this row is ABSORBED — branch
+`r1-tombstone`, see `docs/phase/TOMBSTONE-RETROFIT.md` (forget-law
+retrofit, forged-FORGET rejection, +42.7 B/forget measured). The OUT
+half (hash-chaining tit-quilt's witness log) remains open.**
+
 tit-quilt already shipped the law M4 wants: "Provenance integrity law.
 Nothing witness-referenced is ever destroyed. `FORGET` never deletes: it
 tombstones — cell identity, version, witness" (`tit_quilt/engine.py`,
