@@ -122,7 +122,7 @@ pub fn coverage(f: &Fabric) -> Coverage {
                 }
                 // C6: phi feeding arith/cmp/branch computation
                 for (user, _) in f.uses_of(id) {
-                    if let Some(u) = f.cell(user) {
+                    if let Some(u) = f.cell(*user) {
                         if matches!(
                             u.kind,
                             CellKind::Arith { .. } | CellKind::Cmp { .. } | CellKind::Branch { .. }
@@ -290,7 +290,7 @@ pub fn mut_add_phi(f: &Fabric, rng: &mut Rng) -> Fabric {
         None => return g,
     };
     let ty = if rng.chance(50) { rand_type(rng, false) } else { Type::I32 };
-    let preds = g.predecessors(r);
+    let preds: Vec<RegionId> = g.predecessors(r).to_vec();
     let mut joins = vec![];
     let mut ops = vec![];
     for p in preds {
