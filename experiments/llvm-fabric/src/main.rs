@@ -87,9 +87,11 @@ fn cmd_fuzz(args: &[String]) {
         Ok(st) => {
             println!("iters:                 {}", st.iters);
             println!("valid (by generator):  {}", st.valid);
+            println!("phis generated:        {}", st.phis);
             println!("cells provenance-walked: {}", st.cells_walked);
             println!("roundtrip failures:    {}", st.roundtrip_fail);
             println!("prov failures:         {}", st.prov_fail);
+            println!("ctrl-prov failures:    {}", st.ctrl_fail);
             println!("replay failures:       {}", st.replay_fail);
             println!(
                 "panics:                {}  (a panic crashes this process; 0 here means none)",

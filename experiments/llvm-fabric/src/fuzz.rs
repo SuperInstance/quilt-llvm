@@ -230,8 +230,37 @@ pub fn gen_fabric(rng: &mut Rng) -> Fabric {
 
     // 3. Phis: insert before the (not yet added) terminator position,
     //    i.e. at end of the body built so far. Joins = actual preds.
+    //
+    //    v1 FIX (booked in EXPERIMENTS.md): v0 called f.predecessors()
+    //    here, BEFORE terminators were placed — so preds was always empty
+    //    and the corpus NEVER generated a single phi (0 in 2,000 fabrics,
+    //    measured). Preds now come from the planned `terms` table, which
+    //    matches f.predecessors() exactly once terminators land.
+    let planned_preds = |r: RegionId| -> Vec<RegionId> {
+        let mut out: Vec<RegionId> = vec![];
+        for (i, t) in terms.iter().enumerate() {
+            let from = region_ids[i];
+            match t {
+                Term::Br(a, b) => {
+                    for x in [*a, *b] {
+                        if x == r && !out.contains(&from) {
+                            out.push(from);
+                        }
+                    }
+                }
+                Term::Jmp(t) => {
+                    if *t == r && !out.contains(&from) {
+                        out.push(from);
+                    }
+                }
+                Term::Ret() => {}
+            }
+        }
+        out.sort_by_key(|x| x.0);
+        out
+    };
     for &r in &region_ids {
-        let preds = f.predecessors(r);
+        let preds = planned_preds(r);
         if preds.is_empty() || !rng.chance(60) {
             continue;
         }
@@ -314,7 +343,7 @@ pub fn mutate(f: &Fabric, rng: &mut Rng) -> Fabric {
         return g;
     }
     let victim = *rng.pick(&present).expect("nonempty");
-    match rng.below(9) {
+    match rng.below(10) {
         0 => {
             // operand points out of bounds
             let bad = CellId(g.slab.len() as u32 + 7);
@@ -405,7 +434,7 @@ pub fn mutate(f: &Fabric, rng: &mut Rng) -> Fabric {
                 }
             }
         }
-        _ => {
+        8 => {
             // make a branch condition i32
             let pool: Vec<CellId> = present
                 .iter()
@@ -421,6 +450,28 @@ pub fn mutate(f: &Fabric, rng: &mut Rng) -> Fabric {
                 }
             }
         }
+        _ => {
+            // drop a phi join+operand pair: the region keeps a predecessor
+            // edge the mux no longer selects — V16 territory
+            let phis: Vec<CellId> = present
+                .iter()
+                .copied()
+                .filter(|&id| matches!(g.cell(id).map(|c| &c.kind), Some(CellKind::Phi { .. })))
+                .collect();
+            if let Some(&p) = rng.pick(&phis) {
+                if let Some(c) = g.cell_mut(p) {
+                    if let CellKind::Phi { joins } = &mut c.kind {
+                        if joins.len() > 1 {
+                            let i = rng.below(joins.len() as u64) as usize;
+                            joins.remove(i);
+                            if c.operands.len() > i {
+                                c.operands.remove(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     g
 }
@@ -429,12 +480,14 @@ pub fn mutate(f: &Fabric, rng: &mut Rng) -> Fabric {
 pub struct CorpusStats {
     pub iters: u64,
     pub valid: u64,
+    pub phis: u64, // phis present in generated fabrics (v1: generator fix guard)
     pub cells_walked: u64, // provenance walks performed (one per cell)
     pub mutated: u64,
     pub mutated_still_valid: u64,
     pub rejected: BTreeMap<String, u64>,
     pub roundtrip_fail: u64,
     pub prov_fail: u64,
+    pub ctrl_fail: u64, // full (data+control) provenance failures
     pub replay_fail: u64,
     pub panics: u64, // can only be observed as a test/bin crash; kept for the report
 }
@@ -458,6 +511,11 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
         }
         st.valid += 1;
         st.cells_walked += f.cells().count() as u64;
+        for id in f.cells() {
+            if matches!(f.cell(id).map(|c| &c.kind), Some(CellKind::Phi { .. })) {
+                st.phis += 1;
+            }
+        }
 
         // valid fabrics must round-trip through text
         let once = crate::text::print(&f);
@@ -475,6 +533,15 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
             if let Err(e) = crate::prov::check_prov(&f, id) {
                 st.prov_fail += 1;
                 return Err(format!("seed {}: provenance of {} failed: {}", seed, id, e));
+            }
+        }
+
+        // v1: the FULL walk (data + control) from every cell must also
+        // terminate, stay inside the fabric, and show the control closure
+        for id in f.cells() {
+            if let Err(e) = crate::ctrl::check_full_prov(&f, id) {
+                st.ctrl_fail += 1;
+                return Err(format!("seed {}: full provenance of {} failed: {}", seed, id, e));
             }
         }
 
@@ -537,7 +604,9 @@ mod tests {
         assert_eq!(st.valid, 400);
         assert_eq!(st.roundtrip_fail, 0);
         assert_eq!(st.prov_fail, 0);
+        assert_eq!(st.ctrl_fail, 0, "full provenance must hold on every generated fabric");
         assert_eq!(st.replay_fail, 0);
+        assert!(st.phis > 0, "generator must actually produce phis (v0 dead-step regression guard)");
         assert!(st.mutated > 0, "mutations must actually happen");
         assert!(
             st.mutated_still_valid > 0,

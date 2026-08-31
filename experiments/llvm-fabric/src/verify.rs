@@ -77,6 +77,59 @@ pub fn verify(f: &Fabric) -> Result<(), VerifyError> {
         }
     }
 
+    // V17: the operand graph must be acyclic. Cycles are only reachable
+    // through phis (V12 blocks same-region use-before-def for non-phi
+    // cells, but phis are exempt — a phi may join a value defined in a
+    // later region, and that value may use entry cells, closing a loop
+    // through the entry phi). A cycle also makes `Cell::ty_of` recurse
+    // forever (phi type = first operand's type) — found by the corpus
+    // (seed 1032071, mutation made a phi its own operand); v0 never saw
+    // it because the generator never emitted phis (booked in
+    // EXPERIMENTS.md). Checked HERE, before any ty_of call.
+    {
+        // 0 = unvisited, 1 = on stack, 2 = done
+        let n = f.slab.len();
+        let mut color = vec![0u8; n];
+        for start in f.cells() {
+            if color[start.0 as usize] != 0 {
+                continue;
+            }
+            // iterative DFS with explicit stack of (cell, next-slot)
+            let mut stack: Vec<(CellId, usize)> = vec![(start, 0)];
+            color[start.0 as usize] = 1;
+            while let Some(&mut (id, ref mut slot)) = stack.last_mut() {
+                let ops = match f.cell(id) {
+                    Some(c) => &c.operands,
+                    None => {
+                        stack.pop();
+                        color[id.0 as usize] = 2;
+                        continue;
+                    }
+                };
+                if *slot >= ops.len() {
+                    stack.pop();
+                    color[id.0 as usize] = 2;
+                    continue;
+                }
+                let next = ops[*slot];
+                *slot += 1;
+                match color.get(next.0 as usize).copied().unwrap_or(2) {
+                    0 => {
+                        color[next.0 as usize] = 1;
+                        stack.push((next, 0));
+                    }
+                    1 => {
+                        return Err(fail(
+                            "V17",
+                            format!("operand cycle: {} is its own (transitive) operand via {}", next, id),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // V02: region references are in bounds.
     for id in f.cells() {
         let c = f.cell(id).expect("present");
@@ -164,6 +217,33 @@ pub fn verify(f: &Fabric) -> Result<(), VerifyError> {
                 }
                 if joins[..i].contains(&r) {
                     return Err(fail("V14", format!("phi {} joins '{}' twice", id, f.region_name(r))));
+                }
+            }
+        }
+    }
+
+    // V16: control well-formedness — a phi is a mux over its region's
+    // incoming ctrl edges; every real predecessor must carry exactly one
+    // join (V06/V14 checked realness/uniqueness above; this checks
+    // COMPLETENESS). A predecessor edge without a join entry would be a
+    // value arriving on an unselected path — the "silent no-op wire"
+    // quilt-scratch's TILE-CONTRACT names as the worst failure mode.
+    // Cited in EXPERIMENTS.md §v1; the book closing the v0 control-gap.
+    for id in f.cells() {
+        let c = f.cell(id).expect("present");
+        if let CellKind::Phi { joins } = &c.kind {
+            let preds = f.predecessors(c.region);
+            for &p in &preds {
+                if !joins.contains(&p) {
+                    return Err(fail(
+                        "V16",
+                        format!(
+                            "phi {} in '{}' has no join for predecessor '{}' — control edge without a mux input",
+                            id,
+                            f.region_name(c.region),
+                            f.region_name(p)
+                        ),
+                    ));
                 }
             }
         }
@@ -523,8 +603,21 @@ mod tests {
     #[test]
     fn v12_use_before_def_same_region() {
         let mut f = good();
+        // v1 note: the original fixture made %1 its own operand (a cycle);
+        // V17 (operand-acyclicity) now fires first, so the fixture uses a
+        // LATER cell instead — still exactly the use-before-def case V12
+        // exists for, now without accidentally testing V17.
+        let mut later = Cell::new(f.entry().unwrap(), CellKind::Arith { op: ArithOp::Add, ty: Type::I32 });
+        later.operands = vec![CellId(0), CellId(0)];
+        let later_id = f.add_cell(f.entry().unwrap(), later);
+        // splice it right AFTER %1 so %1 sees a later-defined cell
+        let cells = &mut f.regions[0].cells;
+        let later_pos = cells.iter().position(|&c| c == later_id).unwrap();
+        cells.remove(later_pos); // take it off the end first
+        let pos = cells.iter().position(|&c| c == CellId(1)).unwrap();
+        cells.insert(pos + 1, later_id);
         if let Some(c) = f.cell_mut(CellId(1)) {
-            c.operands = vec![CellId(1), CellId(0)];
+            c.operands = vec![later_id, CellId(0)];
         }
         assert_eq!(code_of(&f), "V12");
     }
@@ -619,5 +712,146 @@ mod tests {
         f.add_cell(b, p);
         f.add_cell(b, Cell::new(b, CellKind::Ret));
         assert_eq!(code_of(&f), "V12");
+    }
+}
+
+#[cfg(test)]
+mod v16_tests {
+    use super::*;
+    use crate::cell::{Cell, CellKind};
+    use crate::id::CellId;
+    use crate::ty::ConstVal;
+
+    fn code_of(f: &Fabric) -> Code {
+        verify(f).expect_err("test fabric must fail").code
+    }
+
+    /// Two preds, phi joins only one of them: a control edge without a
+    /// mux input — V16. (v1 rule; see EXPERIMENTS.md.)
+    #[test]
+    fn v16_phi_missing_a_predecessor_join() {
+        let mut f = Fabric::empty();
+        let e = f.add_region("entry");
+        let t = f.add_region("t");
+        let el = f.add_region("el");
+        let j = f.add_region("j");
+        let bi1 = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+        let mut br = Cell::new(e, CellKind::Branch { then_r: t, else_r: el });
+        br.operands = vec![bi1];
+        f.add_cell(e, br);
+        let vt = f.add_cell(t, Cell::new(t, CellKind::Const { ty: Type::I32, val: ConstVal::I32(1) }));
+        f.add_cell(t, Cell::new(t, CellKind::Jump { target: j }));
+        f.add_cell(el, Cell::new(el, CellKind::Jump { target: j }));
+        // phi joins ONLY 't' — 'el' is a real predecessor with no mux input
+        let mut phi = Cell::new(j, CellKind::Phi { joins: vec![t] });
+        phi.operands = vec![vt];
+        let phi_id = f.add_cell(j, phi);
+        let mut r = Cell::new(j, CellKind::Ret);
+        r.operands = vec![phi_id];
+        f.add_cell(j, r);
+        assert_eq!(code_of(&f), "V16");
+    }
+
+    /// The same diamond with BOTH joins verifies: V16 accepts completeness.
+    #[test]
+    fn v16_complete_phi_verifies() {
+        let text = "fabric v0\n\
+region entry\n\
+  %0 = param i32\n\
+  %1 = const i1 true\n\
+  %2 = br %1, t, el\n\
+region t\n\
+  %3 = const i32 1\n\
+  %4 = jump j\n\
+region el\n\
+  %5 = const i32 2\n\
+  %6 = jump j\n\
+region j\n\
+  %7 = phi [t: %3] [el: %5]\n\
+  %8 = ret %7\n";
+        let f = crate::text::parse(text).expect("diamond parses");
+        assert!(verify(&f).is_ok());
+    }
+
+    /// A region with preds but NO phi at all is fine — V16 constrains
+    /// phis, not regions.
+    #[test]
+    fn v16_region_without_phi_is_legal() {
+        let mut f = Fabric::empty();
+        let e = f.add_region("entry");
+        let t = f.add_region("t");
+        let el = f.add_region("el");
+        let j = f.add_region("j");
+        let bi1 = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I1, val: ConstVal::I1(true) }));
+        let mut br = Cell::new(e, CellKind::Branch { then_r: t, else_r: el });
+        br.operands = vec![bi1];
+        f.add_cell(e, br);
+        f.add_cell(t, Cell::new(t, CellKind::Jump { target: j }));
+        f.add_cell(el, Cell::new(el, CellKind::Jump { target: j }));
+        f.add_cell(j, Cell::new(j, CellKind::Ret));
+        assert!(verify(&f).is_ok());
+        let _ = CellId(0);
+    }
+}
+
+#[cfg(test)]
+mod v17_tests {
+    use super::*;
+    use crate::cell::{Cell, CellKind};
+    use crate::id::CellId;
+    use crate::ty::{ConstVal, Type};
+
+    fn code_of(f: &Fabric) -> Code {
+        verify(f).expect_err("test fabric must fail").code
+    }
+
+    /// Regression (corpus seed 1032071): a phi that joins ITSELF. v0's
+    /// ty_of recursed forever on this; V17 must reject it first — and
+    /// fast, not via stack overflow.
+    #[test]
+    fn v17_phi_self_cycle_is_rejected_not_a_hang() {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("r0");
+        let r1 = f.add_region("r1");
+        let v = f.add_cell(r0, Cell::new(r0, CellKind::Const { ty: Type::I32, val: ConstVal::I32(1) }));
+        // %1 in r0: phi [r1: %1] — joins r1 (r1 jumps to r0), operand is
+        // itself, defined in entry => passes V05/V06/V07/V16, only V17
+        // catches the cycle
+        let mut phi = Cell::new(r0, CellKind::Phi { joins: vec![r1] });
+        phi.operands = vec![CellId(1)];
+        let phi_id = f.add_cell(r0, phi);
+        let _ = v;
+        f.add_cell(r0, Cell::new(r0, CellKind::Jump { target: r1 }));
+        f.add_cell(r1, Cell::new(r1, CellKind::Jump { target: r0 }));
+        assert_eq!(code_of(&f), "V17");
+        assert!(f.cell(phi_id).is_some());
+    }
+
+    /// Indirect cycle: entry phi A joins value from r1; that value uses
+    /// entry phi B; B's join operand is that same r1 value. The loop
+    /// passes through NON-phi cells — V17 must still catch it.
+    #[test]
+    fn v17_indirect_cycle_through_arith() {
+        let mut f = Fabric::empty();
+        let r0 = f.add_region("r0");
+        let r1 = f.add_region("r1");
+        // %0 = phi [r1: %3]   (entry phi, operand in r1)
+        let mut a = Cell::new(r0, CellKind::Phi { joins: vec![r1] });
+        a.operands = vec![CellId(3)];
+        f.add_cell(r0, a);
+        // %1 = phi [r1: %3]   (second entry phi, same operand)
+        let mut b = Cell::new(r0, CellKind::Phi { joins: vec![r1] });
+        b.operands = vec![CellId(3)];
+        f.add_cell(r0, b);
+        f.add_cell(r0, Cell::new(r0, CellKind::Jump { target: r1 }));
+        // r1: %2 = arith.add %0(entry), %1(entry) ; %3 = phi [r0: %2]
+        let mut ar = Cell::new(r1, CellKind::Arith { op: crate::cell::ArithOp::Add, ty: Type::I32 });
+        ar.operands = vec![CellId(0), CellId(1)];
+        f.add_cell(r1, ar);
+        let mut c = Cell::new(r1, CellKind::Phi { joins: vec![r0] });
+        c.operands = vec![CellId(2)];
+        f.add_cell(r1, c);
+        f.add_cell(r1, Cell::new(r1, CellKind::Jump { target: r0 }));
+        assert_eq!(code_of(&f), "V17");
     }
 }

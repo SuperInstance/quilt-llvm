@@ -18,5 +18,6 @@ pub mod conserve;
 pub mod replay;
 pub mod passes;
 pub mod prov;
+pub mod ctrl;
 pub mod pipeline;
 pub mod bench;
