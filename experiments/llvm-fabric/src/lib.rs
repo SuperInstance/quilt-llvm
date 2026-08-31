@@ -20,5 +20,6 @@ pub mod passes;
 pub mod prov;
 pub mod ctrl;
 pub mod program;
+pub mod sign;
 pub mod pipeline;
 pub mod bench;

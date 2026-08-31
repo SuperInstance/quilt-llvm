@@ -215,6 +215,7 @@ pub struct Row {
     pub baseline_print_ns: u128,
     pub parse_ns: u128,
     pub verify_ns: u128,
+    pub sig_ns: u128,
 }
 
 pub fn measure(shape: &str, f: &Fabric, reps: usize) -> Row {
@@ -222,6 +223,7 @@ pub fn measure(shape: &str, f: &Fabric, reps: usize) -> Row {
     let mut bp = vec![];
     let mut pa = vec![];
     let mut ve = vec![];
+    let mut sg = vec![];
     let mut text = String::new();
     for i in 0..reps {
         let t = Instant::now();
@@ -236,6 +238,9 @@ pub fn measure(shape: &str, f: &Fabric, reps: usize) -> Row {
         let t = Instant::now();
         let _ = crate::verify::verify(f);
         ve.push(t.elapsed().as_nanos());
+        let t = Instant::now();
+        let _ = crate::sign::fabric_sig(f);
+        sg.push(t.elapsed().as_nanos());
         let _ = i;
     }
     Row {
@@ -247,6 +252,7 @@ pub fn measure(shape: &str, f: &Fabric, reps: usize) -> Row {
         baseline_print_ns: median_ns(&mut bp),
         parse_ns: median_ns(&mut pa),
         verify_ns: median_ns(&mut ve),
+        sig_ns: median_ns(&mut sg),
     }
 }
 
@@ -261,7 +267,7 @@ pub fn history_overhead(f: &Fabric) -> Result<(usize, usize, usize), String> {
 
 pub fn bench() -> String {
     let mut out = String::new();
-    out.push_str("shape                cells   fabric-B  base-B  ratio  print-us  baseprint-us  parse-us  verify-us\n");
+    out.push_str("shape                cells   fabric-B  base-B  ratio  print-us  baseprint-us  parse-us  verify-us  sig-us\n");
     let mut shapes: Vec<(String, Fabric)> = vec![];
     for n in [50u64, 200, 800] {
         shapes.push((format!("chain-{}", n), chain(n)));
@@ -276,7 +282,7 @@ pub fn bench() -> String {
     for (name, f) in &shapes {
         let r = measure(name, f, 21);
         out.push_str(&format!(
-            "{:<20} {:>5} {:>9} {:>7} {:>6.2} {:>8.1} {:>12.1} {:>9.1} {:>9.1}\n",
+            "{:<20} {:>5} {:>9} {:>7} {:>6.2} {:>8.1} {:>12.1} {:>9.1} {:>9.1} {:>8.1}\n",
             r.shape,
             r.cells,
             r.fabric_bytes,
@@ -286,6 +292,7 @@ pub fn bench() -> String {
             r.baseline_print_ns as f64 / 1000.0,
             r.parse_ns as f64 / 1000.0,
             r.verify_ns as f64 / 1000.0,
+            r.sig_ns as f64 / 1000.0,
         ));
     }
     out.push_str("\nhistory overhead (4-pass pipeline on foldchain-N):\n");

@@ -93,6 +93,7 @@ fn cmd_fuzz(args: &[String]) {
             println!("roundtrip failures:    {}", st.roundtrip_fail);
             println!("prov failures:         {}", st.prov_fail);
             println!("ctrl-prov failures:    {}", st.ctrl_fail);
+            println!("weft failures:         {}", st.weft_fail);
             println!("replay failures:       {}", st.replay_fail);
             println!(
                 "panics:                {}  (a panic crashes this process; 0 here means none)",
@@ -122,6 +123,17 @@ fn cmd_pipeline(args: &[String]) {
         Ok((final_f, history, _)) => {
             println!("== history ==" );
             print!("{}", history.render(&final_f));
+            println!("== weft (signature chain + progress law) ==");
+            for t in &history.weft {
+                println!(
+                    "  tick {} {} sig={:016x} chain={:016x} :: {}",
+                    t.epoch, t.pass, t.sig, t.chain, t.note
+                );
+            }
+            if let Err(e) = history.check_weft() {
+                println!("  WEFT LAW VIOLATED: {}", e);
+                exit(1);
+            }
             println!("== final fabric ==");
             print!("{}", llvm_fabric::text::print(&final_f));
             match llvm_fabric::verify::verify(&final_f) {
@@ -179,6 +191,13 @@ fn cmd_inline(args: &[String]) {
         Ok((final_f, history, _)) => {
             println!("== history ==");
             print!("{}", history.render(&final_f));
+            println!("== weft (signature chain + progress law) ==");
+            for t in &history.weft {
+                println!(
+                    "  tick {} {} sig={:016x} chain={:016x} :: {}",
+                    t.epoch, t.pass, t.sig, t.chain, t.note
+                );
+            }
             println!("== final main ==");
             print!("{}", llvm_fabric::text::print(&final_f));
             match llvm_fabric::verify::verify(&final_f) {

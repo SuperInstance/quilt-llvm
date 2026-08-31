@@ -54,7 +54,7 @@ fn run_named(
             }
             other => return Err(format!("unknown pass {}", other)),
         };
-        h.push(rec);
+        h.push_tick(rec, &cur);
         stages.push(cur.clone());
     }
     Ok((cur, h, stages))

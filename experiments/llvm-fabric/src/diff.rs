@@ -121,9 +121,15 @@ fn render_standalone(f: &crate::fabric::Fabric, id: CellId, cell: &crate::cell::
 }
 
 /// Append-only history. Epochs are assigned on push, monotonically.
+///
+/// v1: the Weft — every tick recorded via `push_tick` lands a
+/// hash-chained `TickSig` (fabric signature + chain + a MECHANICAL
+/// progress entry). `push` is the v0 path (no Weft entry); histories are
+/// all-or-nothing by law (`check_weft` rejects a partial Weft).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct History {
     pub records: Vec<DiffRecord>,
+    pub weft: Vec<crate::sign::TickSig>,
 }
 
 impl History {
@@ -136,6 +142,98 @@ impl History {
         let epoch = rec.epoch;
         self.records.push(rec);
         epoch
+    }
+
+    /// v1 tick: append the diff record AND record its Weft entry —
+    /// signature of `fabric_after`, chained to the previous tick, with
+    /// the progress entry derived mechanically from the diff.
+    pub fn push_tick(&mut self, mut rec: DiffRecord, fabric_after: &crate::fabric::Fabric) -> u64 {
+        rec.epoch = self.records.len() as u64;
+        let epoch = rec.epoch;
+        let sig = crate::sign::fabric_sig(fabric_after);
+        let prev = self.weft.last().map(|t| t.chain);
+        let chain = crate::sign::TickSig::chain_step(prev, epoch, rec.pass, sig);
+        let advanced = !rec.edits.is_empty();
+        let note = if advanced {
+            format!("advanced ({} edits)", rec.edits.len())
+        } else {
+            format!("fixed point — no edits fired")
+        };
+        self.weft.push(crate::sign::TickSig {
+            epoch,
+            pass: rec.pass,
+            sig,
+            chain,
+            advanced,
+            note,
+        });
+        self.records.push(rec);
+        epoch
+    }
+
+    /// The progress law, made checkable: a history that records ANY
+    /// Weft entries must record one per tick (gapless, in step with the
+    /// records), every entry carries a non-empty progress note, and
+    /// non-advancing ticks declare fixed point explicitly.
+    pub fn check_weft(&self) -> Result<(), String> {
+        if self.weft.is_empty() {
+            return Ok(()); // v0-style history: pre-law, labeled, allowed
+        }
+        if self.weft.len() != self.records.len() {
+            return Err(format!(
+                "progress law violated: weft covers {}/{} ticks — partial recording is forbidden",
+                self.weft.len(),
+                self.records.len()
+            ));
+        }
+        for (i, t) in self.weft.iter().enumerate() {
+            if t.epoch != i as u64 {
+                return Err(format!("progress law violated: weft[{}] has epoch {}", i, t.epoch));
+            }
+            if t.note.trim().is_empty() {
+                return Err(format!("progress law violated: tick {} has a blank note", i));
+            }
+            if !t.advanced && !t.note.contains("fixed point") {
+                return Err(format!(
+                    "progress law violated: tick {} neither advanced nor declared fixed point",
+                    i
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Chain verification against replayed stages: stages[0] is the
+    /// pre-tick fabric, stages[i+1] the fabric after tick i. Every
+    /// recorded signature must match the actual stage, and the chain
+    /// must re-link. A tampered stage fails naming its tick.
+    pub fn verify_chain(&self, stages: &[crate::fabric::Fabric]) -> Result<(), String> {
+        if self.weft.is_empty() {
+            return Ok(());
+        }
+        if stages.len() != self.weft.len() + 1 {
+            return Err(format!(
+                "chain verification: {} stages for {} weft entries",
+                stages.len(),
+                self.weft.len()
+            ));
+        }
+        let mut prev: Option<u64> = None;
+        for (i, t) in self.weft.iter().enumerate() {
+            let actual = crate::sign::fabric_sig(&stages[i + 1]);
+            if actual != t.sig {
+                return Err(format!(
+                    "chain verification: tick {} recorded sig {:016x} but the stage hashes {:016x} — history does not match the fabric",
+                    i, t.sig, actual
+                ));
+            }
+            let want = crate::sign::TickSig::chain_step(prev, t.epoch, t.pass, t.sig);
+            if want != t.chain {
+                return Err(format!("chain verification: tick {} does not re-link", i));
+            }
+            prev = Some(t.chain);
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -207,5 +305,96 @@ mod tests {
         let m = h.mentions_of(CellId(3));
         assert_eq!(m.len(), 1);
         assert!(m[0].2.contains("retargeted"));
+    }
+}
+
+#[cfg(test)]
+mod weft_tests {
+    use super::*;
+    use crate::cell::{Cell, CellKind};
+    use crate::fabric::Fabric;
+    use crate::ty::{ConstVal, Type};
+
+    fn mix() -> Fabric {
+        let mut f = Fabric::empty();
+        let e = f.add_region("entry");
+        let p = f.add_cell(e, Cell::new(e, CellKind::Param { ty: Type::I32 }));
+        let c1 = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I32, val: ConstVal::I32(20) }));
+        let c2 = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I32, val: ConstVal::I32(22) }));
+        let mut a = Cell::new(e, CellKind::Arith { op: crate::cell::ArithOp::Add, ty: Type::I32 });
+        a.operands = vec![c1, c2];
+        let a = f.add_cell(e, a);
+        let dead = f.add_cell(e, Cell::new(e, CellKind::Const { ty: Type::I64, val: ConstVal::I64(7) }));
+        let mut a2 = Cell::new(e, CellKind::Arith { op: crate::cell::ArithOp::Add, ty: Type::I32 });
+        a2.operands = vec![p, a];
+        let a2 = f.add_cell(e, a2);
+        let mut r = Cell::new(e, CellKind::Ret);
+        r.operands = vec![a2];
+        f.add_cell(e, r);
+        let _ = dead;
+        f
+    }
+
+    fn run_pipeline(f: &Fabric) -> (Fabric, History, Vec<Fabric>) {
+        crate::pipeline::run(f).expect("pipeline")
+    }
+
+    #[test]
+    fn weft_records_every_tick_with_progress() {
+        let f = mix();
+        let (final_f, h, stages) = run_pipeline(&f);
+        assert_eq!(h.weft.len(), h.records.len(), "one weft entry per tick");
+        assert!(h.check_weft().is_ok());
+        // ticks 0-1 advance; tick 2 (second constfold) is a fixed point
+        assert!(h.weft[0].advanced && h.weft[0].note.contains("advanced"));
+        assert!(!h.weft[2].advanced, "second constfold fires nothing: {:?}", h.weft[2].note);
+        assert!(h.weft[2].note.contains("fixed point"), "{}", h.weft[2].note);
+        // chain verifies against the actual stages
+        assert!(h.verify_chain(&stages).is_ok());
+        let _ = final_f;
+    }
+
+    #[test]
+    fn tampered_stage_breaks_the_chain_with_the_tick_number() {
+        let f = mix();
+        let (_, h, mut stages) = run_pipeline(&f);
+        // tamper with stage 1 (after constfold): flip the folded const
+        let mut g = stages[1].clone();
+        let ids: Vec<_> = g.cells().collect();
+        for id in ids {
+            if let Some(c) = g.cell_mut(id) {
+                if let CellKind::Const { val, .. } = &mut c.kind {
+                    *val = ConstVal::I32(999);
+                }
+            }
+        }
+        stages[1] = g;
+        let err = h.verify_chain(&stages).unwrap_err();
+        assert!(err.contains("tick 0"), "{}", err);
+    }
+
+    #[test]
+    fn partial_weft_violates_the_law() {
+        let f = mix();
+        let (_, mut h, _) = run_pipeline(&f);
+        h.weft.pop();
+        let err = h.check_weft().unwrap_err();
+        assert!(err.contains("progress law"), "{}", err);
+        assert!(err.contains("3/4"), "{}", err);
+    }
+
+    #[test]
+    fn blank_note_violates_the_law() {
+        let f = mix();
+        let (_, mut h, _) = run_pipeline(&f);
+        h.weft[1].note = "  ".into();
+        assert!(h.check_weft().is_err());
+    }
+
+    #[test]
+    fn v0_push_only_history_is_labeled_pre_law_not_rejected() {
+        let mut h = History::new();
+        h.push(DiffRecord::new("old"));
+        assert!(h.check_weft().is_ok(), "v0-style: empty weft is allowed (pre-law)");
     }
 }

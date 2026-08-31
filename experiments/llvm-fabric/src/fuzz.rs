@@ -488,6 +488,7 @@ pub struct CorpusStats {
     pub roundtrip_fail: u64,
     pub prov_fail: u64,
     pub ctrl_fail: u64, // full (data+control) provenance failures
+    pub weft_fail: u64, // signature-chain / progress-law failures
     pub replay_fail: u64,
     pub panics: u64, // can only be observed as a test/bin crash; kept for the report
 }
@@ -546,9 +547,18 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
         }
 
         // pipeline + replay: history must reproduce every intermediate
-        // fabric bit-identically (structural + canonical text)
+        // fabric bit-identically (structural + canonical text), and the
+        // Weft must record every tick with progress + a verifying chain
         match crate::pipeline::run(&f) {
             Ok((final_f, history, stages)) => {
+                if let Err(e) = history.check_weft() {
+                    st.weft_fail += 1;
+                    return Err(format!("seed {}: weft law: {}", seed, e));
+                }
+                if let Err(e) = history.verify_chain(&stages) {
+                    st.weft_fail += 1;
+                    return Err(format!("seed {}: weft chain: {}", seed, e));
+                }
                 match crate::replay::replay(&f, &history) {
                     Ok((replayed, final_r)) => {
                         if replayed.len() != stages.len()
@@ -605,6 +615,7 @@ mod tests {
         assert_eq!(st.roundtrip_fail, 0);
         assert_eq!(st.prov_fail, 0);
         assert_eq!(st.ctrl_fail, 0, "full provenance must hold on every generated fabric");
+        assert_eq!(st.weft_fail, 0, "weft law + chain must hold on every pipeline run");
         assert_eq!(st.replay_fail, 0);
         assert!(st.phis > 0, "generator must actually produce phis (v0 dead-step regression guard)");
         assert!(st.mutated > 0, "mutations must actually happen");
