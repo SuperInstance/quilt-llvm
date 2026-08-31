@@ -13,7 +13,9 @@ use crate::id::CellId;
 
 /// Apply one edit. Order matters: AddCell ids must be the next free slab
 /// slot; RemoveCell must find the cell present; Retarget must find the
-/// `from` operand in place.
+/// `from` operand in place. All three go through the sanctioned fabric
+/// mutators, so replayed fabrics carry maintained use/pred tables too
+/// (the derivability law holds on every replayed stage — tested).
 pub fn apply_edit(f: &mut Fabric, e: &Edit) -> Result<(), String> {
     match e {
         Edit::AddCell { id, index, cell } => {
@@ -28,27 +30,22 @@ pub fn apply_edit(f: &mut Fabric, e: &Edit) -> Result<(), String> {
             Ok(())
         }
         Edit::RemoveCell { id, ledger, .. } => {
-            let cell = f.cell(*id).ok_or_else(|| format!("RemoveCell {}: no such cell present", id))?;
-            let region = cell.region;
-            let cells = &mut f.regions[region.0 as usize].cells;
-            let pos = cells
-                .iter()
-                .position(|&c| c == *id)
-                .ok_or_else(|| format!("RemoveCell {}: not listed in its region", id))?;
-            cells.remove(pos);
-            f.slab[id.0 as usize] = None;
             // M4.1 (tit-quilt retrofit): a parseable death certificate
             // carries a tombstone — the ledger line IS the graveyard's
             // carrier, so replay rebuilds it bit-identically from the
             // ledger alone. Non-certificate removals (constfold folds,
             // the old dce prose) tombstone nothing.
+            let had = f.remove_cell(*id).is_some();
+            if !had {
+                return Err(format!("RemoveCell {}: no such cell present", id));
+            }
             if let Some(cert) = crate::decay::DeathCert::parse(ledger, *id) {
                 f.tombstones.push(cert.tombstone());
             }
             Ok(())
         }
         Edit::Retarget { cell, slot, from, to } => {
-            let c = f.cell_mut(*cell).ok_or_else(|| format!("Retarget: {} not present", cell))?;
+            let c = f.cell(*cell).ok_or_else(|| format!("Retarget: {} not present", cell))?;
             let s = *slot as usize;
             let got = *c
                 .operands
@@ -60,7 +57,7 @@ pub fn apply_edit(f: &mut Fabric, e: &Edit) -> Result<(), String> {
                     cell, slot, got, from
                 ));
             }
-            c.operands[s] = *to;
+            f.retarget(*cell, *slot, *to).ok_or_else(|| format!("Retarget: {} not present", cell))?;
             Ok(())
         }
     }
@@ -74,6 +71,7 @@ fn place(f: &mut Fabric, id: CellId, index: usize, cell: Cell) -> Result<(), Str
     let r = &mut f.regions[cell.region.0 as usize];
     let idx = index.min(r.cells.len());
     r.cells.insert(idx, id);
+    f.register_cell(id, idx);
     Ok(())
 }
 

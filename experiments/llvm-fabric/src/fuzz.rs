@@ -490,6 +490,7 @@ pub struct CorpusStats {
     pub ctrl_fail: u64, // full (data+control) provenance failures
     pub weft_fail: u64, // signature-chain / progress-law failures
     pub replay_fail: u64,
+    pub tables_fail: u64, // maintained != derived use/pred/succ tables (R2)
     pub panics: u64, // can only be observed as a test/bin crash; kept for the report
 }
 
@@ -511,6 +512,15 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
             return Err(format!("seed {}: generator produced invalid fabric: {}", seed, e));
         }
         st.valid += 1;
+        // R2 (the replay law applied to indexes): the maintained tables
+        // must be bit-identical to a from-scratch derivation, on the
+        // generated fabric and on EVERY pipeline/replayed stage. The
+        // mutated fabric is deliberately EXEMPT — forgeries desync by
+        // design and the verifier gates them before table queries.
+        if crate::usetables::UseTables::derive(&f) != f.tables {
+            st.tables_fail += 1;
+            return Err(format!("seed {}: maintained tables diverged from derivation", seed));
+        }
         st.cells_walked += f.cells().count() as u64;
         for id in f.cells() {
             if matches!(f.cell(id).map(|c| &c.kind), Some(CellKind::Phi { .. })) {
@@ -559,6 +569,15 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
                     st.weft_fail += 1;
                     return Err(format!("seed {}: weft chain: {}", seed, e));
                 }
+                for stage in &stages {
+                    if crate::usetables::UseTables::derive(stage) != stage.tables {
+                        st.tables_fail += 1;
+                        return Err(format!(
+                            "seed {}: pipeline stage tables diverged from derivation",
+                            seed
+                        ));
+                    }
+                }
                 match crate::replay::replay(&f, &history) {
                     Ok((replayed, final_r)) => {
                         if replayed.len() != stages.len()
@@ -567,6 +586,15 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
                         {
                             st.replay_fail += 1;
                             return Err(format!("seed {}: replay diverged from pipeline", seed));
+                        }
+                        for stage in &replayed {
+                            if crate::usetables::UseTables::derive(stage) != stage.tables {
+                                st.tables_fail += 1;
+                                return Err(format!(
+                                    "seed {}: replayed stage tables diverged from derivation",
+                                    seed
+                                ));
+                            }
                         }
                     }
                     Err(e) => {
@@ -617,6 +645,7 @@ mod tests {
         assert_eq!(st.ctrl_fail, 0, "full provenance must hold on every generated fabric");
         assert_eq!(st.weft_fail, 0, "weft law + chain must hold on every pipeline run");
         assert_eq!(st.replay_fail, 0);
+        assert_eq!(st.tables_fail, 0, "maintained tables must stay derivable (R2 law)");
         assert!(st.phis > 0, "generator must actually produce phis (v0 dead-step regression guard)");
         assert!(st.mutated > 0, "mutations must actually happen");
         assert!(
@@ -625,6 +654,24 @@ mod tests {
             st.mutated_still_valid
         );
         assert!(st.rejected_total() > 0, "mutations must produce rejections");
+    }
+
+    /// R2's derivability deliverable: the WHOLE 10k corpus (the same
+    /// seed law as the published 10,000/10,000 replay number), every
+    /// pipeline stage and every replayed stage — maintained use/pred/
+    /// succ tables bit-identical to a from-scratch derivation. Runtime
+    /// guard: 400 iters run in well under a second in debug; 10k is
+    /// the same loop 25x.
+    #[test]
+    fn tables_derivable_bit_identical_10k_corpus() {
+        let iters: u64 = std::env::var("QUILT_UT_ITERS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        let st = corpus_run(iters, 0xFAB1C).expect("corpus invariants");
+        assert_eq!(st.valid, iters);
+        assert_eq!(st.tables_fail, 0, "10k corpus: tables must be derivable everywhere");
+        assert_eq!(st.replay_fail, 0);
     }
 
     #[test]

@@ -24,9 +24,12 @@ fn main() {
         "bench" => {
             println!("{}", llvm_fabric::bench::bench());
         }
+        "utbench" => {
+            println!("{}", llvm_fabric::bench::utbench());
+        }
         _ => {
             eprintln!(
-                "usage: llvm-fabric <version|print FILE|verify FILE|fuzz [--iters N] [--seed S]|pipeline FILE|prov FILE CELL|replay FILE|manager FILE [PASSES...]|decay-curve [--iters N]|semmut [--iters N] [--seed S]|bench>"
+                "usage: llvm-fabric <version|print FILE|verify FILE|fuzz [--iters N] [--seed S]|pipeline FILE|prov FILE CELL|replay FILE|manager FILE [PASSES...]|decay-curve [--iters N]|semmut [--iters N] [--seed S]|bench|utbench>"
             );
             exit(2);
         }
@@ -345,7 +348,10 @@ fn cmd_semmut(args: &[String]) {
         i += 1;
     }
     match llvm_fabric::semmut::semmut_run(iters, seed) {
-        Ok(r) => print!("{}", r),
+        Ok(r) => {
+            print!("{}", r);
+            print!("{}", llvm_fabric::semmut::judge_cost_report(&r));
+        }
         Err(e) => {
             eprintln!("semantic battery invariant violated: {}", e);
             exit(1);

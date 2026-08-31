@@ -12,6 +12,7 @@
 use crate::cell::{Cell, CellKind};
 use crate::decay::Tombstone;
 use crate::id::{CellId, RegionId};
+use crate::usetables::{kind_succs, UseTables};
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Region {
@@ -28,12 +29,28 @@ pub struct Wire {
     pub slot: u32,
 }
 
-#[derive(Clone, PartialEq, Debug, Default)]
+/// Fabric equality observes CONTENT, not derived indexes: regions,
+/// slab, graveyard. The use/pred/succ tables (R2) are a maintained
+/// derivative of the content and are excluded on purpose — a fabric
+/// and its freshly-re-derived twin are the same fabric (the replay
+/// law applied to indexes; see usetables.rs).
+impl PartialEq for Fabric {
+    fn eq(&self, other: &Self) -> bool {
+        self.regions == other.regions && self.slab == other.slab && self.tombstones == other.tombstones
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Fabric {
     /// regions[0] is the entry region, when any.
     pub regions: Vec<Region>,
     /// Cell slab. `None` = removed (or not yet assigned). Index = CellId.
     pub slab: Vec<Option<Cell>>,
+    /// Maintained use/pred/succ tables (R2 lane B). Derived, not
+    /// content: excluded from PartialEq, from `text::print`, and from
+    /// the fabric signature. Maintained in O(degree) by every
+    /// sanctioned edit; re-derivable at any time via `rebuild_tables`.
+    pub tables: UseTables,
     /// The graveyard: hash-only tombstones of FORGOTTEN cells
     /// (tit-quilt's provenance-integrity law retrofitted; see decay.rs).
     /// NOT part of `text::print` — the fabric signature observes the
@@ -49,6 +66,7 @@ impl Fabric {
 
     pub fn add_region(&mut self, name: impl Into<String>) -> RegionId {
         self.regions.push(Region { name: name.into(), cells: vec![] });
+        self.tables.ensure_rows(self.regions.len());
         RegionId(self.regions.len() as u32 - 1)
     }
 
@@ -75,7 +93,31 @@ impl Fabric {
             .unwrap_or_else(|| panic!("place in nonexistent region {:?}", region));
         let idx = index.min(r.cells.len());
         r.cells.insert(idx, id);
+        self.register_cell(id, idx);
         id
+    }
+
+    /// Table maintenance for a freshly-placed cell: register its use
+    /// edges, and — when it landed at the END of its region — recompute
+    /// that region's successor row (the old scan derived succs from the
+    /// last cell; any edit that changes which cell is last, or its
+    /// kind, must refresh the row). O(degree of the placed cell).
+    pub(crate) fn register_cell(&mut self, id: CellId, idx_in_region: usize) {
+        // keep the users index in lockstep with the slab (holes included)
+        while self.tables.users.len() < self.slab.len() {
+            self.tables.users.push(vec![]);
+        }
+        let cell = match self.cell(id) {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        for (slot, &op) in cell.operands.iter().enumerate() {
+            self.tables.add_use(op, id, slot as u32);
+        }
+        let cells = &self.regions[cell.region.0 as usize].cells;
+        if cells.len() == idx_in_region + 1 && cells.last() == Some(&id) {
+            self.tables.set_succs(cell.region, kind_succs(&cell.kind));
+        }
     }
 
     /// Place a cell under an explicit id (used by the parser and by
@@ -100,7 +142,105 @@ impl Fabric {
             .get_mut(region.0 as usize)
             .ok_or_else(|| format!("cell {} placed in nonexistent region {}", id, region))?;
         r.cells.push(id);
+        let at = r.cells.len() - 1;
+        self.register_cell(id, at);
         Ok(())
+    }
+
+    /// REMOVE a cell through the sanctioned vocabulary: slab hole,
+    /// region-list removal, and use/succ table repair — all O(degree
+    /// of the removed cell). No tombstone: for a ledgered death use
+    /// `forget`; for pass-time removals pair this with an Edit.
+    /// Returns the removed cell, or None if absent.
+    pub fn remove_cell(&mut self, id: CellId) -> Option<Cell> {
+        let cell = self.cell(id)?.clone();
+        let cells = &mut self.regions[cell.region.0 as usize].cells;
+        let pos = cells.iter().position(|&c| c == id)?;
+        let was_last = pos + 1 == cells.len();
+        cells.remove(pos);
+        self.slab[id.0 as usize] = None;
+        self.unregister_cell(id, &cell, was_last, cell.region);
+        Some(cell)
+    }
+
+    /// Table maintenance for a removed cell: drop its outgoing use
+    /// edges; if it was its region's last cell, recompute that
+    /// region's successors from whatever is last now (possibly
+    /// nothing — a region without a terminator has no succs).
+    /// O(degree of the removed cell).
+    fn unregister_cell(&mut self, id: CellId, cell: &Cell, was_last: bool, region: RegionId) {
+        for (slot, &op) in cell.operands.iter().enumerate() {
+            self.tables.remove_use(op, id, slot as u32);
+        }
+        if was_last {
+            let new_succs = self
+                .regions
+                .get(region.0 as usize)
+                .and_then(|r| r.cells.last().copied())
+                .and_then(|last| self.cell(last))
+                .map(|c| kind_succs(&c.kind))
+                .unwrap_or_default();
+            self.tables.set_succs(region, new_succs);
+        }
+    }
+
+    /// REWIRE one operand slot (a "rewire"/edge edit): user.slot now
+    /// reads `to`. O(1) table work plus the row moves. Returns the old
+    /// operand (None when user/slot absent). Forging paths that need
+    /// out-of-bounds operands may keep raw `cell_mut` — V01 catches
+    /// them before any table query matters.
+    pub fn retarget(&mut self, user: CellId, slot: u32, to: CellId) -> Option<CellId> {
+        let from = *self.cell(user)?.operands.get(slot as usize)?;
+        if from == to {
+            return Some(from);
+        }
+        self.cell_mut(user)?.operands[slot as usize] = to;
+        self.tables.move_use(from, to, user, slot);
+        Some(from)
+    }
+
+    /// Swap a cell's kind through the sanctioned vocabulary. When the
+    /// cell is its region's terminator-in-last-position, the succ/pred
+    /// tables are repaired (Br→Jmp, Br→Ret, ...). Operand wires are
+    /// untouched — pair with `set_operands`/`retarget` as needed.
+    /// Returns the old kind.
+    pub fn set_kind(&mut self, id: CellId, kind: CellKind) -> Option<CellKind> {
+        let c = self.cell_mut(id)?;
+        let old = std::mem::replace(&mut c.kind, kind);
+        let region = c.region;
+        let is_last = self
+            .regions
+            .get(region.0 as usize)
+            .and_then(|r| r.cells.last())
+            .map(|&l| l == id)
+            .unwrap_or(false);
+        if is_last {
+            let new_succs = kind_succs(&self.cell(id).expect("present").kind);
+            self.tables.set_succs(region, new_succs);
+        }
+        Some(old)
+    }
+
+    /// Replace a cell's whole operand list (bulk rewire — e.g. a phi
+    /// dropping a join+operand pair). O(old + new degree).
+    pub fn set_operands(&mut self, id: CellId, ops: &[CellId]) -> Option<()> {
+        let c = self.cell_mut(id)?;
+        let old = std::mem::replace(&mut c.operands, ops.to_vec());
+        for (slot, &op) in old.iter().enumerate() {
+            self.tables.remove_use(op, id, slot as u32);
+        }
+        for (slot, &op) in ops.iter().enumerate() {
+            self.tables.add_use(op, id, slot as u32);
+        }
+        Some(())
+    }
+
+    /// Re-derive the tables from the slab in O(n) — the ground truth
+    /// the maintained tables must equal (the replay law applied to
+    /// indexes). The recovery path for raw tooling that pokes
+    /// `slab`/`regions` directly.
+    pub fn rebuild_tables(&mut self) {
+        self.tables = UseTables::derive(self);
     }
 
     pub fn cell(&self, id: CellId) -> Option<&Cell> {
@@ -126,7 +266,8 @@ impl Fabric {
         }
         let cell = self
             .cell(cert.cell)
-            .ok_or_else(|| format!("forget {}: no such cell (and no tombstone)", cert.cell))?;
+            .ok_or_else(|| format!("forget {}: no such cell (and no tombstone)", cert.cell))?
+            .clone();
         let want = crate::sign::fnv1a64(crate::text::render_cell(self, cert.cell).as_bytes());
         if want != cert.vhash {
             return Err(format!(
@@ -146,8 +287,10 @@ impl Fabric {
             .iter()
             .position(|&c| c == cert.cell)
             .ok_or_else(|| format!("forget {}: not listed in its region", cert.cell))?;
+        let was_last = pos + 1 == cells.len();
         cells.remove(pos);
         self.slab[cert.cell.0 as usize] = None;
+        self.unregister_cell(cert.cell, &cell, was_last, region);
         self.tombstones.push(cert.tombstone());
         Ok(())
     }
@@ -194,55 +337,36 @@ impl Fabric {
         out
     }
 
-    /// Reverse of wires: every user of `id`, as (user, slot).
-    pub fn uses_of(&self, id: CellId) -> Vec<(CellId, u32)> {
-        let mut out = vec![];
-        for user in self.cells() {
-            if let Some(c) = self.cell(user) {
-                for (slot, &op) in c.operands.iter().enumerate() {
-                    if op == id {
-                        out.push((user, slot as u32));
-                    }
-                }
-            }
-        }
-        out
+    /// Reverse of wires: every user of `id`, as (user, slot) — O(degree)
+    /// table lookup (was: a scan over every cell and slot). Rows are
+    /// ordered user-asc, slot-asc, exactly as the scan produced.
+    pub fn uses_of(&self, id: CellId) -> &[(CellId, u32)] {
+        self.tables
+            .users
+            .get(id.0 as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
-    /// Successor regions of a region (from its terminator), deduplicated.
-    pub fn successors(&self, r: RegionId) -> Vec<RegionId> {
-        let mut out = vec![];
-        if let Some(region) = self.region(r) {
-            if let Some(&last) = region.cells.last() {
-                if let Some(c) = self.cell(last) {
-                    match &c.kind {
-                        CellKind::Branch { then_r, else_r } => {
-                            for t in [*then_r, *else_r] {
-                                if !out.contains(&t) {
-                                    out.push(t);
-                                }
-                            }
-                        }
-                        CellKind::Jump { target } => out.push(*target),
-                        CellKind::Ret => {}
-                        _ => {}
-                    }
-                }
-            }
-        }
-        out
+    /// Successor regions of a region (from its terminator), deduplicated
+    /// — O(degree) table lookup (was: read+match the last cell).
+    pub fn successors(&self, r: RegionId) -> &[RegionId] {
+        self.tables
+            .succs
+            .get(r.0 as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
-    /// Predecessor regions of a region, deduplicated, ascending.
-    pub fn predecessors(&self, r: RegionId) -> Vec<RegionId> {
-        let mut out = vec![];
-        for (i, _) in self.regions.iter().enumerate() {
-            let from = RegionId(i as u32);
-            if self.successors(from).contains(&r) && !out.contains(&from) {
-                out.push(from);
-            }
-        }
-        out
+    /// Predecessor regions of a region, deduplicated, ascending —
+    /// O(degree) table lookup (was: a scan over every region × its
+    /// successors).
+    pub fn predecessors(&self, r: RegionId) -> &[RegionId] {
+        self.tables
+            .preds
+            .get(r.0 as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Index of a cell within its region's cell order.

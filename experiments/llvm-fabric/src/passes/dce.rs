@@ -46,11 +46,7 @@ pub fn dce(f: &Fabric) -> Result<(Fabric, DiffRecord), String> {
                 continue;
             }
             let summary = crate::text::render_cell(&g, id);
-            let region = g.cell(id).expect("present").region;
-            let cells = &mut g.regions[region.0 as usize].cells;
-            let pos = cells.iter().position(|&c| c == id).expect("listed");
-            cells.remove(pos);
-            g.slab[id.0 as usize] = None;
+            g.remove_cell(id).expect("dead cell listed in its region");
             rec.edits.push(Edit::RemoveCell {
                 id,
                 ledger: "dead: no path to a terminator".into(),

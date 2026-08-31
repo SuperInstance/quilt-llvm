@@ -46,7 +46,7 @@ fn reaches(f: &Fabric, from: RegionId, to: RegionId) -> bool {
     let mut seen = BTreeSet::new();
     let mut work = vec![from];
     while let Some(r) = work.pop() {
-        for s in f.successors(r) {
+        for &s in f.successors(r) {
             if s == to {
                 return true;
             }
@@ -62,7 +62,7 @@ fn reachable_from_entry(f: &Fabric) -> BTreeSet<RegionId> {
     let mut seen: BTreeSet<RegionId> = [RegionId(0)].into_iter().collect();
     let mut work = vec![RegionId(0)];
     while let Some(r) = work.pop() {
-        for s in f.successors(r) {
+        for &s in f.successors(r) {
             if seen.insert(s) {
                 work.push(s);
             }
@@ -326,8 +326,8 @@ impl Audit {
                 }
                 let preds = f.predecessors(c.region);
                 let mut covered: BTreeSet<RegionId> = joins.iter().copied().collect();
-                for p in &preds {
-                    covered.remove(p);
+                for &p in preds {
+                    covered.remove(&p);
                 }
                 if !covered.is_empty() || joins.len() != preds.len() {
                     self.phi_partial_coverage += 1;

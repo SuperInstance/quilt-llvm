@@ -50,11 +50,9 @@ pub fn diamonds(n: u64) -> Fabric {
         let el = f.add_region(format!("e{}", i));
         let j = f.add_region(format!("j{}", i));
         let split = prev_join.unwrap_or(e);
-        let cmp = f.add_cell(split, Cell::new(split, CellKind::Cmp { op: CmpOp::Lt }));
-        {
-            let c = f.cell_mut(cmp).unwrap();
-            c.operands = vec![p, zero];
-        }
+        let mut cmp = Cell::new(split, CellKind::Cmp { op: CmpOp::Lt });
+        cmp.operands = vec![p, zero];
+        let cmp = f.add_cell(split, cmp);
         let mut br = Cell::new(split, CellKind::Branch { then_r: t, else_r: el });
         br.operands = vec![cmp];
         f.add_cell(split, br);
@@ -349,5 +347,227 @@ mod tests {
         let (ob, fb, hb) = history_overhead(&f).unwrap();
         assert!(fb < ob, "final fabric must be smaller than original");
         assert!(hb > fb, "history must outgrow the final fabric");
+    }
+}
+
+// ---------- R2 use/pred table measurement (docs/phase/USE-TABLES.md) ----------
+
+/// The pre-R2 `uses_of`, verbatim: a scan over every present cell and
+/// slot. Kept here as the honest "before" — measured in the same
+/// binary, same process, as the "after".
+pub fn uses_of_scan(f: &Fabric, id: CellId) -> Vec<(CellId, u32)> {
+    let mut out = vec![];
+    for user in f.cells() {
+        if let Some(c) = f.cell(user) {
+            for (slot, &op) in c.operands.iter().enumerate() {
+                if op == id {
+                    out.push((user, slot as u32));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The pre-R2 `predecessors`, verbatim (successors were a last-cell
+/// read, so the scan is regions × last-cell-kind).
+pub fn predecessors_scan(f: &Fabric, r: RegionId) -> Vec<RegionId> {
+    let mut out = vec![];
+    for (i, _) in f.regions.iter().enumerate() {
+        let from = RegionId(i as u32);
+        let mut succs = vec![];
+        if let Some(region) = f.region(from) {
+            if let Some(&last) = region.cells.last() {
+                if let Some(c) = f.cell(last) {
+                    match &c.kind {
+                        CellKind::Branch { then_r, else_r } => {
+                            for t in [*then_r, *else_r] {
+                                if !succs.contains(&t) {
+                                    succs.push(t);
+                                }
+                            }
+                        }
+                        CellKind::Jump { target } => succs.push(*target),
+                        CellKind::Ret => {}
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if succs.contains(&r) && !out.contains(&from) {
+            out.push(from);
+        }
+    }
+    out
+}
+
+/// Least-squares slope of log(ns) vs log(cells) — the fitted scaling
+/// exponent — with R². Zero dependencies, as always.
+pub fn fit_exponent(cells: &[usize], ns: &[u128]) -> (f64, f64) {
+    let n = cells.len().min(ns.len()) as f64;
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    let mut sxx = 0.0;
+    let mut sxy = 0.0;
+    let mut syy = 0.0;
+    for i in 0..cells.len().min(ns.len()) {
+        let x = (cells[i] as f64).ln();
+        let y = (ns[i] as f64).ln();
+        sx += x;
+        sy += y;
+        sxx += x * x;
+        sxy += x * y;
+        syy += y * y;
+    }
+    let denom = n * sxx - sx * sx;
+    if denom == 0.0 {
+        return (0.0, 0.0);
+    }
+    let slope = (n * sxy - sx * sy) / denom;
+    let r2 = {
+        let num = n * sxy - sx * sy;
+        let den = ((n * sxx - sx * sx) * (n * syy - sy * sy)).sqrt();
+        if den == 0.0 { 0.0 } else { (num / den) * (num / den) }
+    };
+    (slope, r2)
+}
+
+/// The R2 deliverable bench: query cost before (scan) vs after
+/// (tables) across the 53→1443-cell curve, and verify scaling with
+/// the fitted exponent (gate target ≤ 1.2 — reported as measured).
+pub fn utbench() -> String {
+    let mut out = String::new();
+    let mut shapes: Vec<(String, Fabric)> = vec![];
+    for n in [50u64, 200, 800] {
+        shapes.push((format!("chain-{}", n), chain(n)));
+    }
+    for n in [10u64, 40, 160] {
+        shapes.push((format!("diamonds-{}", n), diamonds(n)));
+    }
+    for n in [50u64, 200, 800] {
+        shapes.push((format!("dag-{}", n), dense_dag(n, 42)));
+    }
+
+    out.push_str("query cost (median of 21 sweeps; a sweep = one query per cell / per region)\n");
+    out.push_str("shape          cells   uses-scan-us/sweep   uses-table-us/sweep   preds-scan-us/sweep   preds-table-us/sweep\n");
+    let mut curve_cells: Vec<usize> = vec![];
+    let mut curve_verify_ns: Vec<u128> = vec![];
+    for (name, f) in &shapes {
+        // uses_of: one query per present cell (the DCE/decay sweep shape)
+        let mut scan_sweeps = vec![];
+        let mut table_sweeps = vec![];
+        for _ in 0..21 {
+            let t = Instant::now();
+            for id in f.cells() {
+                let _ = uses_of_scan(f, id);
+            }
+            scan_sweeps.push(t.elapsed().as_nanos());
+            let t = Instant::now();
+            for id in f.cells() {
+                let _ = f.uses_of(id);
+            }
+            table_sweeps.push(t.elapsed().as_nanos());
+        }
+        // predecessors: one query per region (the verify V06/V16 shape)
+        let mut pscan_sweeps = vec![];
+        let mut ptable_sweeps = vec![];
+        for _ in 0..21 {
+            let t = Instant::now();
+            for ri in 0..f.regions.len() as u32 {
+                let _ = predecessors_scan(f, RegionId(ri));
+            }
+            pscan_sweeps.push(t.elapsed().as_nanos());
+            let t = Instant::now();
+            for ri in 0..f.regions.len() as u32 {
+                let _ = f.predecessors(RegionId(ri));
+            }
+            ptable_sweeps.push(t.elapsed().as_nanos());
+        }
+        let cells = f.cells().count();
+        out.push_str(&format!(
+            "{:<14} {:>6} {:>19.1} {:>20.1} {:>20.1} {:>21.1}\n",
+            name,
+            cells,
+            median_ns(&mut scan_sweeps) as f64 / 1000.0,
+            median_ns(&mut table_sweeps) as f64 / 1000.0,
+            median_ns(&mut pscan_sweeps) as f64 / 1000.0,
+            median_ns(&mut ptable_sweeps) as f64 / 1000.0,
+        ));
+        curve_cells.push(cells);
+        curve_verify_ns.push(median_ns(&mut vec![{
+            let t = Instant::now();
+            let _ = crate::verify::verify(f);
+            t.elapsed().as_nanos()
+        }; 21]));
+    }
+    let (slope, r2) = fit_exponent(&curve_cells, &curve_verify_ns);
+    let lo = curve_cells.iter().min().copied().unwrap_or(0);
+    let hi = curve_cells.iter().max().copied().unwrap_or(0);
+    out.push_str(&format!(
+        "\nverify scaling (tables in place): cells {}..={} ; LS exponent all-9 {:.2} (R^2 {:.4})\n",
+        lo, hi, slope, r2
+    ));
+    // the published O(n^1.96) was a two-point ratio (NEXT-PHASE §R2:
+    // chain-50 -> diamonds-160, 27.2x cells -> 642.6x verify); the same
+    // method on this build, plus per-family fits (mixed shapes fit
+    // poorly — R^2 above — so the family reads are the honest ones)
+    let t_small = curve_verify_ns[0] as f64; // chain-50
+    let t_big = curve_verify_ns[5] as f64; // diamonds-160
+    let c_small = curve_cells[0] as f64;
+    let c_big = curve_cells[5] as f64;
+    out.push_str(&format!(
+        "  two-point chain-50->diamonds-160 (the 1.96 method): {:.2}\n",
+        (t_big / t_small).ln() / (c_big / c_small).ln()
+    ));
+    let fams = [
+        ("chain", vec![0usize, 1, 2]),
+        ("diamonds", vec![3usize, 4, 5]),
+        ("dag", vec![6usize, 7, 8]),
+    ];
+    for (name, idxs) in fams {
+        let cs: Vec<usize> = idxs.iter().map(|&i| curve_cells[i]).collect();
+        let ns: Vec<u128> = idxs.iter().map(|&i| curve_verify_ns[i]).collect();
+        let (b, r2) = fit_exponent(&cs, &ns);
+        out.push_str(&format!("  LS {}-only: exponent {:.2} (R^2 {:.4})\n", name, b, r2));
+    }
+    out.push_str("verify per shape (median of 21):\n");
+    for ((name, f), cells) in shapes.iter().zip(curve_cells.iter()) {
+        let mut ve = vec![];
+        for _ in 0..21 {
+            let t = Instant::now();
+            let _ = crate::verify::verify(f);
+            ve.push(t.elapsed().as_nanos());
+        }
+        out.push_str(&format!(
+            "  {:<14} {:>6} cells  {:>9.1} us\n",
+            name,
+            cells,
+            median_ns(&mut ve) as f64 / 1000.0
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod ut_tests {
+    use super::*;
+
+    /// The scan twins must agree bit-for-bit with the maintained
+    /// tables on a real shape (diamonds carry phis, preds, dup-free
+    /// succs) — the "before" baseline is measuring the same thing the
+    /// "after" answers.
+    #[test]
+    fn scan_twins_agree_with_tables() {
+        let f = diamonds(12);
+        for id in f.cells() {
+            assert_eq!(uses_of_scan(&f, id), f.uses_of(id).to_vec(), "uses_of({id})");
+        }
+        for ri in 0..f.regions.len() as u32 {
+            assert_eq!(
+                predecessors_scan(&f, RegionId(ri)),
+                f.predecessors(RegionId(ri)).to_vec(),
+                "preds({ri})"
+            );
+        }
     }
 }

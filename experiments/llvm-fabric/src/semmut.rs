@@ -39,6 +39,7 @@ use crate::id::CellId;
 use crate::ty::{ConstVal, Type};
 use crate::verify::verify;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 /// The semantic mutation kinds. Copy + Eq so stats can key on them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -167,8 +168,14 @@ fn apply_input_mutation(f: &Fabric, kind: SemKind, rng: &mut Rng) -> Option<Fabr
                 })
                 .collect();
             let victim = *rng.pick(&cands)?;
-            let c = g.cell_mut(victim)?;
-            c.operands.swap(0, 1);
+            // sanctioned rewire (two retargets) so the use tables stay
+            // truthful — a raw swap desyncs users[] rows
+            let (a, b) = {
+                let c = g.cell(victim)?;
+                (c.operands[0], c.operands[1])
+            };
+            g.retarget(victim, 0, b)?;
+            g.retarget(victim, 1, a)?;
             Some(g)
         }
         SemKind::CmpOrderedSwap => {
@@ -183,8 +190,12 @@ fn apply_input_mutation(f: &Fabric, kind: SemKind, rng: &mut Rng) -> Option<Fabr
                 })
                 .collect();
             let victim = *rng.pick(&cands)?;
-            let c = g.cell_mut(victim)?;
-            c.operands.swap(0, 1);
+            let (a, b) = {
+                let c = g.cell(victim)?;
+                (c.operands[0], c.operands[1])
+            };
+            g.retarget(victim, 0, b)?;
+            g.retarget(victim, 1, a)?;
             Some(g)
         }
         SemKind::RetValueSwap => {
@@ -212,8 +223,7 @@ fn apply_input_mutation(f: &Fabric, kind: SemKind, rng: &mut Rng) -> Option<Fabr
                 }
             }
             let repl = *rng.pick(&pool)?;
-            let c = g.cell_mut(victim)?;
-            c.operands[0] = repl;
+            g.retarget(victim, 0, repl)?;
             Some(g)
         }
         SemKind::BranchTargetSwap => {
@@ -225,10 +235,10 @@ fn apply_input_mutation(f: &Fabric, kind: SemKind, rng: &mut Rng) -> Option<Fabr
                 })
                 .collect();
             let victim = *rng.pick(&cands)?;
-            if let Some(c) = g.cell_mut(victim) {
-                if let CellKind::Branch { then_r, else_r } = &mut c.kind {
-                    std::mem::swap(then_r, else_r);
-                }
+            // sanctioned kind edit: a terminator kind swap must repair
+            // the succ/pred tables (the region's edge set changes)
+            if let Some(CellKind::Branch { then_r, else_r }) = g.cell(victim).map(|c| c.kind.clone()) {
+                g.set_kind(victim, CellKind::Branch { then_r: else_r, else_r: then_r });
             }
             Some(g)
         }
@@ -272,7 +282,7 @@ fn apply_input_mutation(f: &Fabric, kind: SemKind, rng: &mut Rng) -> Option<Fabr
             }
             let (slot, pool) = rng.pick(&slots)?.clone();
             let repl = *rng.pick(&pool)?;
-            g.cell_mut(victim)?.operands[slot] = repl;
+            g.retarget(victim, slot as u32, repl)?;
             Some(g)
         }
         SemKind::JoinDropWithEdge => {
@@ -292,12 +302,11 @@ fn apply_input_mutation(f: &Fabric, kind: SemKind, rng: &mut Rng) -> Option<Fabr
                 Some((r, CellKind::Branch { then_r, else_r })) => (r, then_r, else_r),
                 _ => return None,
             };
-            // rewire the branch to an unconditional jump on the kept arm
-            {
-                let c = g.cell_mut(victim)?;
-                c.kind = CellKind::Jump { target: keep };
-                c.operands.clear();
-            }
+            // rewire the branch to an unconditional jump on the kept
+            // arm — sanctioned kind edit + operand replacement so the
+            // use tables and the succ/pred tables both stay truthful
+            g.set_kind(victim, CellKind::Jump { target: keep });
+            g.set_operands(victim, &[])?;
             // clean phis in the dropped arm: remove the join that names
             // this source region, with its operand
             let phi_ids: Vec<CellId> = g
@@ -308,15 +317,24 @@ fn apply_input_mutation(f: &Fabric, kind: SemKind, rng: &mut Rng) -> Option<Fabr
                 })
                 .collect();
             for pid in phi_ids {
-                if let Some(c) = g.cell_mut(pid) {
-                    if let CellKind::Phi { joins } = &mut c.kind {
-                        if let Some(pos) = joins.iter().position(|&j| j == src_region) {
-                            joins.remove(pos);
-                            if c.operands.len() > pos {
-                                c.operands.remove(pos);
-                            }
+                let cleaned = g.cell(pid).and_then(|c| match &c.kind {
+                    CellKind::Phi { joins } => {
+                        let pos = joins.iter().position(|&j| j == src_region)?;
+                        let mut ops = c.operands.clone();
+                        if ops.len() > pos {
+                            ops.remove(pos);
                         }
+                        let mut joins2 = joins.clone();
+                        joins2.remove(pos);
+                        Some((joins2, ops))
                     }
+                    _ => None,
+                });
+                if let Some((joins, ops)) = cleaned {
+                    if let Some(c) = g.cell_mut(pid) {
+                        c.kind = CellKind::Phi { joins };
+                    }
+                    g.set_operands(pid, &ops)?;
                 }
             }
             Some(g)
@@ -419,24 +437,50 @@ fn observable(f: &Fabric) -> Option<ConstVal> {
 
 /// The full judge battery for an input fabric — every check the
 /// existing corpus runs against valid fabrics. Returns (judge, fired).
+/// The timings twin (below) is the R2 deliverable: which judge earns
+/// its microseconds.
 pub fn judge_battery(f: &Fabric) -> Vec<(&'static str, bool)> {
+    judge_battery_timed(f).0
+}
+
+/// The judge battery with per-judge wall time (ns). Same order, same
+/// rng-free determinism — timings are observed, never consumed.
+pub fn judge_battery_timed(f: &Fabric) -> (Vec<(&'static str, bool)>, Vec<(&'static str, u128)>) {
     let mut out: Vec<(&'static str, bool)> = vec![];
-    out.push(("verify", verify(f).is_err()));
+    let mut times: Vec<(&'static str, u128)> = vec![];
+    let t = Instant::now();
+    let v = verify(f).is_err();
+    times.push(("verify", t.elapsed().as_nanos()));
+    out.push(("verify", v));
+    let t = Instant::now();
     let once = crate::text::print(f);
     let rt_bad = match crate::text::parse(&once) {
         Ok(f2) => crate::text::print(&f2) != once,
         Err(_) => true,
     };
+    times.push(("roundtrip", t.elapsed().as_nanos()));
     out.push(("roundtrip", rt_bad));
-    out.push(("prov", f.cells().any(|id| crate::prov::check_prov(f, id).is_err())));
-    out.push(("ctrl", f.cells().any(|id| crate::ctrl::check_full_prov(f, id).is_err())));
-    match crate::pipeline::run(f) {
+    let t = Instant::now();
+    let p = f.cells().any(|id| crate::prov::check_prov(f, id).is_err());
+    times.push(("prov", t.elapsed().as_nanos()));
+    out.push(("prov", p));
+    let t = Instant::now();
+    let c = f.cells().any(|id| crate::ctrl::check_full_prov(f, id).is_err());
+    times.push(("ctrl", t.elapsed().as_nanos()));
+    out.push(("ctrl", c));
+    let t = Instant::now();
+    let pipe = crate::pipeline::run(f);
+    times.push(("pipeline", t.elapsed().as_nanos()));
+    match pipe {
         Err(_) => out.push(("pipeline", true)),
         Ok((final_f, history, stages)) => {
             let weft_bad =
                 history.check_weft().is_err() || history.verify_chain(&stages).is_err();
             out.push(("weft", weft_bad));
-            match crate::replay::replay(f, &history) {
+            let t = Instant::now();
+            let rep = crate::replay::replay(f, &history);
+            let rep_ns = t.elapsed().as_nanos();
+            match rep {
                 Err(_) => out.push(("replay", true)),
                 Ok((replayed, final_r)) => {
                     let diverged = replayed.len() != stages.len()
@@ -445,15 +489,23 @@ pub fn judge_battery(f: &Fabric) -> Vec<(&'static str, bool)> {
                     out.push(("replay", diverged));
                 }
             }
-            out.push(("conserve", crate::conserve::check_pipeline(f, &final_f, &history).is_err()));
+            times.push(("replay", rep_ns));
+            let t = Instant::now();
+            let cons = crate::conserve::check_pipeline(f, &final_f, &history).is_err();
+            times.push(("conserve", t.elapsed().as_nanos()));
+            out.push(("conserve", cons));
         }
     }
-    out
+    (out, times)
 }
 
 /// The tamper control: corrupt a folded const in the pipeline OUTPUT;
-/// history still claims the untampered edit stream.
-fn run_stage_tamper(f: &Fabric, rng: &mut Rng) -> Option<(Vec<(&'static str, bool)>, bool)> {
+/// history still claims the untampered edit stream. Judges timed (the
+/// 76/76 replay kills live here — their cost belongs in the R2 table).
+fn run_stage_tamper(
+    f: &Fabric,
+    rng: &mut Rng,
+) -> Option<(Vec<(&'static str, bool)>, Vec<(&'static str, u128)>, bool)> {
     let (final_f, history, _stages) = crate::pipeline::run(f).ok()?;
     let cands: Vec<CellId> = final_f
         .cells()
@@ -474,20 +526,41 @@ fn run_stage_tamper(f: &Fabric, rng: &mut Rng) -> Option<(Vec<(&'static str, boo
     // judges over the tampered OUTPUT: structural checks + replay
     // bit-identity + conservation against the claimed history
     let mut judges = vec![];
-    judges.push(("verify", verify(&t).is_err()));
+    let mut times = vec![];
+    let sw = Instant::now();
+    let v = verify(&t).is_err();
+    times.push(("verify", sw.elapsed().as_nanos()));
+    judges.push(("verify", v));
+    let sw = Instant::now();
     let once = crate::text::print(&t);
     let rt_bad = match crate::text::parse(&once) {
         Ok(f2) => crate::text::print(&f2) != once,
         Err(_) => true,
     };
+    times.push(("roundtrip", sw.elapsed().as_nanos()));
     judges.push(("roundtrip", rt_bad));
+    let sw = Instant::now();
     let diverged = match crate::replay::replay(f, &history) {
         Ok((_, final_r)) => final_r != t,
         Err(_) => true,
     };
+    times.push(("replay", sw.elapsed().as_nanos()));
     judges.push(("replay", diverged));
-    judges.push(("conserve", crate::conserve::check_pipeline(f, &t, &history).is_err()));
-    Some((judges, true)) // tamper is wrong by construction
+    let sw = Instant::now();
+    let cons = crate::conserve::check_pipeline(f, &t, &history).is_err();
+    times.push(("conserve", sw.elapsed().as_nanos()));
+    judges.push(("conserve", cons));
+    Some((judges, times, true)) // tamper is wrong by construction
+}
+
+/// Per-judge cost accounting (R2): how many times each judge ran,
+/// how many mutants it killed (fired), and how long it took. The
+/// gate's question: which judge earns its microseconds?
+#[derive(Debug, Default, Clone)]
+pub struct JudgeCost {
+    pub calls: u64,
+    pub fired: u64,
+    pub ns: u128,
 }
 
 /// Per-kind statistics.
@@ -508,6 +581,12 @@ pub struct KindStat {
 pub struct SemReport {
     pub iters: u64,
     pub kinds: BTreeMap<&'static str, KindStat>,
+    /// Wall time per judge across the whole battery (input kinds +
+    /// tamper control). Timings do NOT participate in equality/Display
+    /// determinism — they are an observation about cost, not a result.
+    pub judge_cost: BTreeMap<String, JudgeCost>,
+    /// The dataflow wrongness oracle's own cost (sem classification).
+    pub oracle_cost: JudgeCost,
 }
 
 impl SemReport {
@@ -545,15 +624,23 @@ pub fn semmut_run(iters: u64, seed0: u64) -> Result<SemReport, String> {
         if kind == SemKind::StageTamperControl {
             match run_stage_tamper(&f, &mut rng) {
                 None => st.no_site += 1,
-                Some((judges, wrong)) => {
+                Some((judges, times, wrong)) => {
                     st.judged += 1;
                     if wrong {
                         st.sem_wrong += 1;
+                    }
+                    for (name, ns) in &times {
+                        let jc = report.judge_cost.entry(name.to_string()).or_default();
+                        jc.calls += 1;
+                        jc.ns += *ns;
                     }
                     let killed = judges.iter().any(|(_, fired)| *fired);
                     for (name, fired) in judges {
                         if fired {
                             *st.fired.entry(name.to_string()).or_insert(0) += 1;
+                            if let Some(jc) = report.judge_cost.get_mut(name) {
+                                jc.fired += 1;
+                            }
                         }
                     }
                     if killed {
@@ -577,14 +664,21 @@ pub fn semmut_run(iters: u64, seed0: u64) -> Result<SemReport, String> {
         }
         st.judged += 1;
 
-        // wrongness classification
+        // wrongness classification (the property oracle, timed: its
+        // kill-rate-per-microsecond is part of the R2 judge-cost table)
         if kind.is_dataflow() {
-            match (observable(&f), observable(&mutant)) {
+            let t = Instant::now();
+            let obs = (observable(&f), observable(&mutant));
+            let oracle_ns = t.elapsed().as_nanos();
+            report.oracle_cost.calls += 2; // two observable() evaluations
+            report.oracle_cost.ns += oracle_ns;
+            match obs {
                 (Some(a), Some(b)) => {
                     if a == b {
                         st.sem_equivalent += 1;
                     } else {
                         st.sem_wrong += 1;
+                        report.oracle_cost.fired += 1; // the oracle "kills": proves wrongness
                     }
                 }
                 _ => st.unjudgeable += 1,
@@ -593,11 +687,22 @@ pub fn semmut_run(iters: u64, seed0: u64) -> Result<SemReport, String> {
             st.unjudgeable += 1;
         }
 
-        let judges = judge_battery(&mutant);
+        let (judges, times) = judge_battery_timed(&mutant);
+        for (name, ns) in &times {
+            let jc = report
+                .judge_cost
+                .entry(name.to_string())
+                .or_default();
+            jc.calls += 1;
+            jc.ns += *ns;
+        }
         let killed = judges.iter().any(|(_, fired)| *fired);
         for (name, fired) in judges {
             if fired {
                 *st.fired.entry(name.to_string()).or_insert(0) += 1;
+                if let Some(jc) = report.judge_cost.get_mut(name) {
+                    jc.fired += 1;
+                }
             }
         }
         if killed {
@@ -605,6 +710,53 @@ pub fn semmut_run(iters: u64, seed0: u64) -> Result<SemReport, String> {
         }
     }
     Ok(report)
+}
+
+impl JudgeCost {
+    /// kills per microsecond this judge (or oracle) spent judging.
+    pub fn kills_per_us(&self) -> f64 {
+        if self.ns == 0 {
+            0.0
+        } else {
+            self.fired as f64 / (self.ns as f64 / 1000.0)
+        }
+    }
+    pub fn us_total(&self) -> f64 {
+        self.ns as f64 / 1000.0
+    }
+}
+
+/// The R2 judge-cost table: per judge (and the dataflow oracle), how
+/// many calls, how many kills, total microseconds, and
+/// kills-per-microsecond. Timings are one session's wall clock — an
+/// observation about cost, labeled as such (not a deterministic
+/// result; excluded from Display on purpose).
+pub fn judge_cost_report(r: &SemReport) -> String {
+    let mut out = String::new();
+    out.push_str("judge cost (wall time, this run): kills-per-microsecond per judge
+");
+    out.push_str("judge          calls   kills   total-us   us/call   kills/us
+");
+    let mut rows: Vec<(&str, &JudgeCost)> = r
+        .judge_cost
+        .iter()
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    rows.push(("oracle(dataflow)", &r.oracle_cost));
+    rows.sort_by_key(|(k, _)| *k);
+    for (name, jc) in rows {
+        let us_per_call = if jc.calls > 0 { jc.us_total() / jc.calls as f64 } else { 0.0 };
+        out.push_str(&format!(
+            "{:<14} {:>6} {:>7} {:>10.1} {:>9.2} {:>10.3}\n",
+            name,
+            jc.calls,
+            jc.fired,
+            jc.us_total(),
+            us_per_call,
+            jc.kills_per_us()
+        ));
+    }
+    out
 }
 
 impl std::fmt::Display for SemReport {
