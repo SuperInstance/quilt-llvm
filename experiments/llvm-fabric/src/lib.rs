@@ -24,4 +24,5 @@ pub mod sign;
 pub mod pipeline;
 pub mod manager;
 pub mod decay;
+pub mod semmut;
 pub mod bench;
