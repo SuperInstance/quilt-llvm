@@ -1,19 +1,23 @@
-//! R2 region-edit spike — the R3 gate-decider (GATE-W2 §4, NEXT-PHASE §6).
+//! R2 region-edit spike — graduated into the real vocabulary in R3
+//! (lane r3-lane1). The R2 spike proved the core surgery verify-legal
+//! and MEASURED the diff-vocabulary gap (region-DCE replayed 0/140,
+//! inline 0/34 — inexpressible, not divergent). R3 closes it: the
+//! Edit enum grew RegionAdded / RegionRemoved (id compaction) /
+//! MoveCell / RelabelJoin, and every op below records and applies
+//! REAL edits through `replay::apply_edit` — so the streams replay
+//! bit-identically by construction and the R2 use tables stay
+//! maintained (the raw-mutation desync the merged spike left behind —
+//! six red master tests — is gone with the raw paths themselves).
 //!
-//! The question this module answers, with measurements: can the three
-//! blocked passes' CORE SURGERY (const-branch fold, region-DCE,
-//! CFG-graft inline) be expressed as verify-legal edits on real bred
-//! fabrics, reusing `semmut`'s join-drop-with-edge operator rather
-//! than reimplementing it?
-//!
-//! API surface (spike-grade; ugly is allowed, legal is not optional):
+//! API surface:
 //!
 //! * [`region_add`] — add an empty region (caller must populate it
-//!   with a terminator before `verify` will pass; V03).
+//!   with a terminator before `verify` will pass; V03). RegionAdded
+//!   edit.
 //! * [`region_remove`] — remove ONE region: refuses if anything
 //!   reachable-from-entry still points at it; compacts region ids and
-//!   remaps every reference. Direct mutation + recorded note: NOT
-//!   expressible in the current `Edit` vocabulary (the §6 finding).
+//!   remaps every reference. RemoveCell edits + a RegionRemoved edit
+//!   — fully expressible, replayable.
 //! * [`drop_edge`] — Br→Jmp on one arm plus phi-join/operand
 //!   maintenance in the dropped arm. This IS the semmut
 //!   join-drop-with-edge operator, factored out, made
@@ -26,6 +30,7 @@
 //!   control edge appears (the inverse maintenance).
 //! * [`region_graft`] — copy a region from a donor fabric into this
 //!   one with id/region remapping (the CFG-inline primitive).
+//!   RegionAdded + AddCell edits.
 //!
 //! The three passes built on the vocabulary:
 //!
@@ -63,14 +68,17 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Add an empty region. NOTE: an empty region violates V03 — the
 /// caller populates it (cells + terminator) before verifying. Edits:
 /// none expressible (no RegionAdded kind); a note is recorded.
+/// Add an empty region. NOTE: an empty region violates V03 — the
+/// caller populates it (cells + terminator) before verifying. R3:
+/// expressed as a real edit (`RegionAdded`), applied through
+/// `replay::apply_edit` — replayable, table-maintained.
 pub fn region_add(f: &Fabric, name: &str) -> (Fabric, RegionId, DiffRecord) {
     let mut g = f.clone();
-    let r = g.add_region(name);
     let mut rec = DiffRecord::new("region-add");
-    rec.notes.push(format!(
-        "region '{}' added as region {} — NOT expressible in the Edit vocabulary (no RegionAdded kind); recorded as a note",
-        name, r.0
-    ));
+    let r = RegionId(g.regions.len() as u32);
+    let e = Edit::RegionAdded { id: r, name: name.to_string() };
+    replay::apply_edit(&mut g, &e).expect("region ids append-only");
+    rec.edits.push(e);
     (g, r, rec)
 }
 
@@ -104,10 +112,12 @@ pub fn reachable_regions(f: &Fabric) -> BTreeSet<u32> {
 /// * any phi outside `r` joins on `r` (strip those joins first —
 ///   see `region_dce`, which does exactly that).
 ///
-/// The id compaction + remap is direct mutation: the current Edit
-/// vocabulary has no RegionRemoved/region-renumber kinds. The record
-/// carries RemoveCell edits (replayable cell-level history) plus a
-/// note naming the inexpressible part.
+/// R3: fully expressed — RemoveCell edits carry the cells, the new
+/// `RegionRemoved` edit carries the removal + compaction, and every
+/// edit is applied through `replay::apply_edit`, so the edit stream
+/// reproduces the fabric bit-identically by construction AND the
+/// use tables stay maintained (the R2 desync the merged spike left
+/// in the raw-mutation path is gone).
 pub fn region_remove(f: &Fabric, r: RegionId) -> Result<(Fabric, DiffRecord), String> {
     let entry = f.entry().ok_or("region_remove: fabric has no regions")?;
     if r == entry {
@@ -153,47 +163,23 @@ pub fn region_remove(f: &Fabric, r: RegionId) -> Result<(Fabric, DiffRecord), St
     let cell_ids: Vec<CellId> = g.region(r).map(|x| x.cells.clone()).unwrap_or_default();
     for id in cell_ids {
         let summary = crate::text::render_cell(&g, id);
-        let region = g.cell(id).expect("present").region;
-        let cells = &mut g.regions[region.0 as usize].cells;
-        let pos = cells.iter().position(|&c| c == id).expect("listed");
-        cells.remove(pos);
-        g.slab[id.0 as usize] = None;
-        rec.edits.push(Edit::RemoveCell {
+        let e = Edit::RemoveCell {
             id,
-            ledger: format!("region-remove: '{}' unreachable, all cells dropped with it", f.region_name(r)),
+            ledger: format!(
+                "region-remove: '{}' unreachable, all cells dropped with it",
+                f.region_name(r)
+            ),
             summary,
-        });
+        };
+        replay::apply_edit(&mut g, &e)?;
+        rec.edits.push(e);
     }
 
-    // 2. compact the region Vec + remap every surviving reference
-    //    (direct mutation — inexpressible in the Edit vocabulary)
-    g.regions.remove(r.0 as usize);
-    let remap = |x: &mut RegionId| {
-        if x.0 > r.0 {
-            x.0 -= 1;
-        }
-    };
-    for c in g.slab.iter_mut().flatten() {
-        remap(&mut c.region);
-        match &mut c.kind {
-            CellKind::Branch { then_r, else_r } => {
-                remap(then_r);
-                remap(else_r);
-            }
-            CellKind::Jump { target } => remap(target),
-            CellKind::Phi { joins } => {
-                for j in joins.iter_mut() {
-                    remap(j);
-                }
-            }
-            _ => {}
-        }
-    }
-    rec.notes.push(format!(
-        "region '{}' removed and ids {}.. compacted — NOT expressible in the Edit vocabulary (no RegionRemoved kind); recorded as a note",
-        f.region_name(r),
-        r.0 + 1
-    ));
+    // 2. remove the region itself: ids compact, references remap —
+    //    now a real edit (RegionRemoved), applied like any other
+    let e = Edit::RegionRemoved { id: r, name: f.region_name(r).to_string() };
+    replay::apply_edit(&mut g, &e)?;
+    rec.edits.push(e);
     Ok((g, rec))
 }
 
@@ -503,8 +489,8 @@ pub fn join_phi(
 /// targets remapped through `region_map` (unmapped target regions are
 /// an error: the graft must be closed under regions it names).
 ///
-/// Records AddCell edits for the copied cells. Region creation itself
-/// is a note (inexpressible). Does NOT verify — the caller composes
+/// Records AddCell edits for the copied cells; the region creation
+/// rides a RegionAdded edit. Does NOT verify — the caller composes
 /// (this is a primitive, not a pass).
 pub fn region_graft(
     f: &Fabric,
@@ -515,13 +501,11 @@ pub fn region_graft(
     name: &str,
 ) -> Result<(Fabric, RegionId, DiffRecord), String> {
     let mut g = f.clone();
-    let new_r = g.add_region(name);
     let mut rec = DiffRecord::new("region-graft");
-    rec.notes.push(format!(
-        "region '{}' grafted as '{}' — RegionAdded inexpressible; cells carried as AddCell edits",
-        donor.region_name(donor_region),
-        name
-    ));
+    let new_r = RegionId(g.regions.len() as u32);
+    let e = Edit::RegionAdded { id: new_r, name: name.to_string() };
+    replay::apply_edit(&mut g, &e)?;
+    rec.edits.push(e);
     region_graft_into(&mut g, donor, donor_region, new_r, cell_map, region_map, &mut rec)?;
     Ok((g, new_r, rec))
 }
@@ -588,9 +572,9 @@ fn region_graft_into(
         }
         let nid = CellId(g.slab.len() as u32);
         let index = g.regions[dest.0 as usize].cells.len();
-        g.regions[dest.0 as usize].cells.push(nid);
-        g.slab.push(Some(cell.clone()));
-        rec.edits.push(Edit::AddCell { id: nid, index, cell });
+        let e = Edit::AddCell { id: nid, index, cell };
+        replay::apply_edit(g, &e)?;
+        rec.edits.push(e);
         local_map.insert(did, nid);
     }
     Ok(())
@@ -917,78 +901,39 @@ pub fn region_dce(f: &Fabric) -> Result<(Fabric, DiffRecord, RegionDceStats), St
         }
     }
 
-    // 2. batch-remove the dead set: strip their cells (RemoveCell
-    //    edits with ledger), drop the regions from the Vec in one
-    //    pass, compact ids once. (Per-region `region_remove` would
-    //    refuse here: dead regions may target other dead regions.)
+    // 2. batch-remove the dead set, each region as REAL edits: its
+    //    cells leave with ledgered RemoveCells, then the region itself
+    //    leaves via RegionRemoved (ids compact, references remap —
+    //    applied through replay::apply_edit so the tables stay
+    //    maintained and the stream replays bit-identically). Ascending
+    //    original order; ids below shift as each removal compacts.
     {
-        let mut keep_regions: Vec<crate::fabric::Region> = vec![];
-        for (i, r) in g.regions.into_iter().enumerate() {
-            if dead_set.contains(&(i as u32)) {
-                st.regions_removed += 1;
-                continue;
-            }
-            keep_regions.push(r);
-        }
-        let orig_len = keep_regions.len() + dead_set.len();
-        g.regions = keep_regions;
-        // old -> new id map for survivors (region ids are dense 0..n)
-        let mut id_map: BTreeMap<u32, u32> = BTreeMap::new();
-        {
-            let mut next = 0u32;
-            for i in 0..orig_len as u32 {
-                if dead_set.contains(&i) {
-                    continue;
-                }
-                id_map.insert(i, next);
-                next += 1;
-            }
-        }
-        // dead cells out of the slab FIRST (their region ids are the
-        // OLD ids; after the remap below they would masquerade as
-        // survivors), with ledger edits
-        for id in (0..g.slab.len() as u32).map(CellId).collect::<Vec<_>>() {
-            if g.cell(id).is_some() {
-                let r = g.cell(id).unwrap().region;
-                if id_map.contains_key(&r.0) {
-                    continue; // survivor
-                }
+        let mut shift: u32 = 0;
+        for &orig in dead.iter() {
+            let cur = RegionId(orig - shift);
+            let cell_ids: Vec<CellId> =
+                g.region(cur).map(|x| x.cells.clone()).unwrap_or_default();
+            for id in cell_ids {
                 let summary = crate::text::render_cell(&g, id);
-                g.slab[id.0 as usize] = None;
-                st.cells_removed += 1;
-                rec.edits.push(Edit::RemoveCell {
+                let e = Edit::RemoveCell {
                     id,
                     ledger: "region-dce: region unreachable from entry, cells dropped with it".into(),
                     summary,
-                });
+                };
+                replay::apply_edit(&mut g, &e)?;
+                rec.edits.push(e);
+                st.cells_removed += 1;
             }
+            let e = Edit::RegionRemoved {
+                id: cur,
+                name: g.region_name(cur).to_string(),
+            };
+            replay::apply_edit(&mut g, &e)?;
+            rec.edits.push(e);
+            st.regions_removed += 1;
+            shift += 1;
         }
-        // then renumber the survivors' region references
-        let remap = |x: &mut RegionId| {
-            if let Some(n) = id_map.get(&x.0) {
-                x.0 = *n;
-            }
-        };
-        for c in g.slab.iter_mut().flatten() {
-            remap(&mut c.region);
-            match &mut c.kind {
-                CellKind::Branch { then_r, else_r } => {
-                    remap(then_r);
-                    remap(else_r);
-                }
-                CellKind::Jump { target } => remap(target),
-                CellKind::Phi { joins } => {
-                    for j in joins.iter_mut() {
-                        remap(j);
-                    }
-                }
-                _ => {}
-            }
-        }
-        rec.notes.push(format!(
-            "{} dead regions removed, region ids compacted — NOT expressible in the Edit vocabulary (no RegionRemoved kind)",
-            dead.len()
-        ));
+        debug_assert_eq!(shift as usize, dead.len());
     }
     if let Err(e) = verify(&g) {
         return Err(format!("region_dce produced an invalid fabric: {}", e));
@@ -1192,27 +1137,26 @@ fn inline_one(
     let mut h = g.clone();
 
     // 1. continuation region K; move post cells + the old terminator
-    //    into it (ids stable — MoveCell is inexpressible; noted)
-    let k = h.add_region(format!("{}_cont", callee_name));
-    notes.push(format!(
-        "continuation region '{}' added — RegionAdded inexpressible in the Edit vocabulary",
-        callee_name
-    ));
+    //    into it (ids stable — a real RegionAdded + MoveCell per cell,
+    //    applied through replay::apply_edit). The CALL stays listed
+    //    in entry until step 9's RemoveCell.
+    let k = RegionId(h.regions.len() as u32);
+    {
+        let e = Edit::RegionAdded { id: k, name: format!("{}_cont", callee_name) };
+        replay::apply_edit(&mut h, &e)?;
+        edits.push(e);
+    }
     {
         let mut moved = post_body.clone();
         moved.push(post.last().copied().expect("entry ends in a terminator"));
-        let n_moved = moved.len();
-        h.regions[entry.0 as usize].cells.truncate(call_pos);
-        for id in moved {
-            if let Some(c) = h.cell_mut(id) {
-                c.region = k;
-            }
-            h.regions[k.0 as usize].cells.push(id);
+        for (i, id) in moved.iter().enumerate() {
+            let e = Edit::MoveCell { id: *id, from: entry, to: k, index: i };
+            replay::apply_edit(&mut h, &e)?;
+            edits.push(e);
         }
         notes.push(format!(
-            "{} entry cells moved to '{}' — MoveCell inexpressible in the Edit vocabulary",
-            n_moved,
-            callee_name
+            "continuation region added; {} entry cells moved to it (ids stable) — RegionAdded + MoveCell edits",
+            moved.len()
         ));
     }
 
@@ -1222,13 +1166,15 @@ fn inline_one(
     let mut region_map: BTreeMap<u32, RegionId> = BTreeMap::new();
     region_map.insert(0, entry);
     for ri in 1..callee.regions.len() as u32 {
-        let r = h.add_region(format!("{}_{}", callee_name, callee.region_name(RegionId(ri))));
+        let r = RegionId(h.regions.len() as u32);
+        let e = Edit::RegionAdded {
+            id: r,
+            name: format!("{}_{}", callee_name, callee.region_name(RegionId(ri))),
+        };
+        replay::apply_edit(&mut h, &e)?;
+        edits.push(e);
         region_map.insert(ri, r);
         st.regions_grafted += 1;
-        notes.push(format!(
-            "region '{}' grafted as fresh region — RegionAdded inexpressible",
-            callee.region_name(RegionId(ri))
-        ));
     }
 
     // 3. cell map starts as params -> args
@@ -1269,36 +1215,40 @@ fn inline_one(
             ops.push(m);
         }
         mapped.operands = ops;
-        let nid = h.insert_cell(entry, insert_at, mapped.clone());
-        edits.push(Edit::AddCell { id: nid, index: insert_at, cell: mapped });
+        let nid = CellId(h.slab.len() as u32);
+        let e = Edit::AddCell { id: nid, index: insert_at, cell: mapped };
+        replay::apply_edit(&mut h, &e)?;
+        edits.push(e);
         cell_map.insert(cid, nid);
         insert_at += 1;
     }
 
-    // 5. graft every non-entry callee region. TWO GLOBAL passes:
-    //    pass A pre-registers fresh ids for EVERY grafted cell first
+    // 5. graft every non-entry callee region. TWO passes over one
+    //    PLAN: pass A assigns fresh ids for EVERY grafted cell first
     //    (phi operands may reference cells in any grafted region —
     //    phis are exempt from V12's same-region rule, so resolution
-    //    needs the full map before any cell is filled); pass B then
-    //    resolves kinds + operands and places. Ret terminators ->
+    //    needs the full map before any cell is placed); pass B then
+    //    resolves kinds + operands and places each cell as a REAL
+    //    AddCell edit (ids land sequentially, so apply_edit's
+    //    next-free-id law holds at every step). Ret terminators ->
     //    Jump(K); other terminators and phi joins remapped through
     //    region_map.
-    for ri in 1..callee.regions.len() as u32 {
-        let dr = RegionId(ri);
-        let dest = *region_map.get(&ri).expect("pre-created");
-        let src_ids: Vec<CellId> = callee.region(dr).map(|x| x.cells.clone()).unwrap_or_default();
-        for &did in &src_ids {
-            let nid = CellId(h.slab.len() as u32);
-            h.slab.push(None); // reserve the slot; filled in pass B
-            h.regions[dest.0 as usize].cells.push(nid);
-            cell_map.insert(did, nid);
+    {
+        let mut next_id = h.slab.len() as u32;
+        for ri in 1..callee.regions.len() as u32 {
+            let dr = RegionId(ri);
+            let src_ids: Vec<CellId> = callee.region(dr).map(|x| x.cells.clone()).unwrap_or_default();
+            for &did in &src_ids {
+                cell_map.insert(did, CellId(next_id));
+                next_id += 1;
+            }
         }
     }
     for ri in 1..callee.regions.len() as u32 {
         let dr = RegionId(ri);
         let dest = *region_map.get(&ri).expect("pre-created");
         let src_ids: Vec<CellId> = callee.region(dr).map(|x| x.cells.clone()).unwrap_or_default();
-        // pass B: resolve kinds + operands, fill the slots
+        // pass B: resolve kinds + operands, place as edits
         for &did in &src_ids {
             let dc = callee.cell(did).expect("present");
             let mut kind = dc.kind.clone();
@@ -1338,14 +1288,11 @@ fn inline_one(
                 ops.push(m);
             }
             cell.operands = ops;
-            let nid = *cell_map.get(&did).expect("pre-registered");
-            let index = h.regions[dest.0 as usize]
-                .cells
-                .iter()
-                .position(|&x| x == nid)
-                .expect("pre-listed");
-            h.slab[nid.0 as usize] = Some(cell.clone());
-            edits.push(Edit::AddCell { id: nid, index, cell });
+            let nid = *cell_map.get(&did).expect("planned");
+            let index = h.regions[dest.0 as usize].cells.len();
+            let e = Edit::AddCell { id: nid, index, cell };
+            replay::apply_edit(&mut h, &e)?;
+            edits.push(e);
         }
     }
 
@@ -1381,16 +1328,20 @@ fn inline_one(
             }
         }
         let at = h.regions[entry.0 as usize].cells.len();
-        h.add_cell(entry, new_term.clone());
-        edits.push(Edit::AddCell { id: CellId(h.slab.len() as u32 - 1), index: at, cell: new_term });
-        notes.push(format!(
-            "entry terminator replaced by the callee entry terminator — terminator replacement + Ret->Jump kind change inexpressible in the Edit vocabulary"
-        ));
+        let nid = CellId(h.slab.len() as u32);
+        let e = Edit::AddCell { id: nid, index: at, cell: new_term };
+        replay::apply_edit(&mut h, &e)?;
+        edits.push(e);
+        notes.push(
+            "entry terminator replaced by the callee entry terminator (old one moved to K; this AddCell appends the new one — fully expressed)".to_string(),
+        );
     }
 
     // 7. relabel joins on the OLD entry-successors: the moved
     //    terminator carries the same edges from K now (V06/V16 exact)
+    //    — a real RelabelJoin edit per phi
     let succs_k: Vec<RegionId> = h.successors(k).to_vec();
+    let mut relabeled = 0usize;
     for &s in succs_k.iter() {
         let phi_ids: Vec<CellId> = h
             .region(s)
@@ -1402,20 +1353,17 @@ fn inline_one(
             })
             .collect();
         for pid in phi_ids {
-            if let Some(c) = h.cell_mut(pid) {
-                if let CellKind::Phi { joins } = &mut c.kind {
-                    for j in joins.iter_mut() {
-                        if *j == entry {
-                            *j = k;
-                        }
-                    }
-                }
-            }
-            notes.push(format!(
-                "phi {} join relabeled entry -> continuation — join relabel inexpressible in the Edit vocabulary",
-                pid
-            ));
+            let e = Edit::RelabelJoin { phi: pid, from: entry, to: k };
+            replay::apply_edit(&mut h, &e)?;
+            edits.push(e);
+            relabeled += 1;
         }
+    }
+    if relabeled > 0 {
+        notes.push(format!(
+            "{} phi joins relabeled entry -> continuation (RelabelJoin edits)",
+            relabeled
+        ));
     }
 
     // 8. the return value: a phi in K over the ret regions, unless the
@@ -1438,11 +1386,13 @@ fn inline_one(
             }
             let mut phi = Cell::new(k, CellKind::Phi { joins });
             phi.operands = ops;
-            let pid = h.insert_cell(k, 0, phi.clone());
-            edits.push(Edit::AddCell { id: pid, index: 0, cell: phi });
+            let pid = CellId(h.slab.len() as u32);
+            let e = Edit::AddCell { id: pid, index: 0, cell: phi };
+            replay::apply_edit(&mut h, &e)?;
+            edits.push(e);
             st.phis_built += 1;
             notes.push(format!(
-                "return phi {} built in the continuation — AddCell-expressible, its RegionAdded context is not",
+                "return phi {} built in the continuation (AddCell in K — fully expressed)",
                 pid
             ));
             pid
@@ -1453,14 +1403,13 @@ fn inline_one(
     //    leaves with a conservation ledger entry
     let uses_call: Vec<(CellId, u32)> = h.uses_of(call_id).to_vec();
     for &(u, slot) in uses_call.iter() {
-        let c = h.cell_mut(u).expect("present");
-        let from = c.operands[slot as usize];
-        c.operands[slot as usize] = ret_val;
-        edits.push(Edit::Retarget { cell: u, slot, from, to: ret_val });
+        let from = h.cell(u).expect("present").operands[slot as usize];
+        let e = Edit::Retarget { cell: u, slot, from, to: ret_val };
+        replay::apply_edit(&mut h, &e)?;
+        edits.push(e);
     }
     let summary = crate::text::render_cell(&h, call_id);
-    h.slab[call_id.0 as usize] = None; // already unlisted from entry in step 1
-    edits.push(Edit::RemoveCell {
+    let e = Edit::RemoveCell {
         id: call_id,
         ledger: format!(
             "cfg-inlined '{}': {} regions grafted, {} params bound to caller args, ret via {}",
@@ -1470,7 +1419,9 @@ fn inline_one(
             ret_val
         ),
         summary,
-    });
+    };
+    replay::apply_edit(&mut h, &e)?;
+    edits.push(e);
     Ok((h, notes, edits, st, true))
 }
 
@@ -1724,6 +1675,60 @@ region merge\n\
         // RemoveCell edits carry ledger entries (conservation shape)
         assert!(rec.edits.iter().any(|e| matches!(e,
             Edit::RemoveCell { ledger, .. } if ledger.contains("region-dce"))));
+        // R3: the gap the spike measured (0/140 replay) is CLOSED — the
+        // RegionRemoved edit carries the compaction, replay reproduces g
+        let mut h = crate::diff::History::new();
+        h.push(rec.clone());
+        let (stages, final_r) = crate::replay::replay(&f, &h).expect("dce replay");
+        assert_eq!(final_r, g, "region-dce replays bit-identically (was 0/140)");
+        for st in &stages {
+            assert_eq!(crate::usetables::UseTables::derive(st), st.tables);
+        }
+        // conservation + lifecycle coupling hold on the region record
+        assert!(crate::conserve::check(&f, &g, &rec).is_ok());
+        assert!(crate::conserve::population_audit(&f, &g, &rec).is_ok());
+    }
+
+    /// The red condition for RegionRemoved: the SAME record minus its
+    /// region edit (the spike's exact vocabulary — cell-level edits
+    /// only) must FAIL to reproduce the fabric. The new kind earns its
+    /// place; without it the gap stands.
+    #[test]
+    fn dce_red_without_region_removed_edit_replay_diverges() {
+        let f = with_unreachable();
+        let (g, rec, _) = region_dce(&f).expect("dce");
+        let mut mutilated = rec.clone();
+        mutilated.edits.retain(|e| !matches!(e, Edit::RegionRemoved { .. }));
+        let mut h = crate::diff::History::new();
+        h.push(mutilated);
+        match crate::replay::replay(&f, &h) {
+            Ok((_, final_r)) => assert_ne!(final_r, g, "cell-level edits alone cannot express region compaction"),
+            Err(_) => {} // a rejection is an equally honest failure to reproduce
+        }
+    }
+
+    /// The standalone raw op records real edits too.
+    #[test]
+    fn region_remove_replays_bit_identically() {
+        // a fabric whose dead region is referenced by nothing: strip
+        // the phi join first is unnecessary — build one
+        let text = "fabric v0\n\
+region entry\n\
+  %0 = const i32 3\n\
+  %1 = ret %0\n\
+region dead\n\
+  %2 = const i32 9\n\
+  %3 = ret %2\n";
+        let f = crate::text::parse(text).expect("parses");
+        assert!(verify(&f).is_ok());
+        let (g, rec) = region_remove(&f, RegionId(1)).expect("dead region removable");
+        assert!(verify(&g).is_ok());
+        assert_eq!(g.regions.len(), 1);
+        let mut h = crate::diff::History::new();
+        h.push(rec);
+        let (_, final_r) = crate::replay::replay(&f, &h).expect("replay");
+        assert_eq!(final_r, g);
+        assert!(crate::conserve::population_audit(&f, &g, &h.records[0]).is_ok());
     }
 
     #[test]
@@ -1805,6 +1810,16 @@ region merge\n\
         // conservation-shaped ledger on the removed call
         assert!(rec.edits.iter().any(|e| matches!(e,
             Edit::RemoveCell { ledger, .. } if ledger.contains("cfg-inlined 'pick'"))));
+        // R3: inline is now fully expressed (RegionAdded + MoveCell +
+        // RelabelJoin joined the vocabulary) — the spike's 0/34 closes
+        let mut h = crate::diff::History::new();
+        h.push(rec);
+        let (stages, final_r) = crate::replay::replay(&f, &h).expect("inline replay");
+        assert_eq!(final_r, g, "cfg-graft inline replays bit-identically (was 0/34)");
+        for st in &stages {
+            assert_eq!(crate::usetables::UseTables::derive(st), st.tables);
+        }
+        assert!(crate::conserve::population_audit(&f, &g, &h.records[0]).is_ok());
     }
 
     #[test]
@@ -1975,10 +1990,19 @@ region entry\n\
         let (_, final_r) = crate::replay::replay(&f, &h).expect("replay");
         assert_eq!(final_r, g1);
         // then DCE whatever the fold stranded, compose green
-        let (g2, _rec2, st2) = region_dce(&g1).expect("dce after fold");
+        let (g2, rec2, st2) = region_dce(&g1).expect("dce after fold");
         assert!(verify(&g2).is_ok());
         assert_eq!(interp(&g2, &BTreeMap::new(), 100_000), b, "dce preserves semantics");
         let _ = st2;
+        // R3: bred-fabric DCE replays bit-identically too (the 140/140
+        // corpus claim, pinned on one bred fabric)
+        let mut h2 = crate::diff::History::new();
+        h2.push(rec2);
+        let (stages2, final_r2) = crate::replay::replay(&g1, &h2).expect("dce replay");
+        assert_eq!(final_r2, g2, "bred region-dce replays bit-identically");
+        for st in &stages2 {
+            assert_eq!(crate::usetables::UseTables::derive(st), st.tables);
+        }
     }
 }
 
