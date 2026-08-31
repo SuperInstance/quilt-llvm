@@ -23,4 +23,5 @@ pub mod program;
 pub mod sign;
 pub mod pipeline;
 pub mod manager;
+pub mod decay;
 pub mod bench;

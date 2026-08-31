@@ -16,6 +16,7 @@ fn main() {
         "fuzz" => cmd_fuzz(&args[2..]),
         "pipeline" => cmd_pipeline(&args[2..]),
         "manager" => cmd_manager(&args[2..]),
+        "decay-curve" => cmd_decay_curve(&args[2..]),
         "prov" => cmd_prov(&args[2..]),
         "replay" => cmd_replay(&args[2..]),
         "inline" => cmd_inline(&args[2..]),
@@ -190,6 +191,36 @@ fn cmd_manager(args: &[String]) {
         }
         Err(e) => {
             eprintln!("manager rejected the run: {}", e);
+            exit(1);
+        }
+    }
+}
+
+fn cmd_decay_curve(args: &[String]) {
+    // M4: measured decay curves over the corpus — cold/warm/dead
+    // classification per stage, deaths per tick, every decay kill
+    // certified + verified as it is measured.
+    let mut iters: u64 = 10_000;
+    let mut seed: u64 = 0xD3CA5;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--iters" => {
+                i += 1;
+                iters = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| panic!("--iters needs a number"));
+            }
+            "--seed" => {
+                i += 1;
+                seed = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| panic!("--seed needs a number"));
+            }
+            other => panic!("unknown decay-curve arg {}", other),
+        }
+        i += 1;
+    }
+    match llvm_fabric::decay::decay_curves(iters, seed) {
+        Ok(c) => print!("{}", c.render()),
+        Err(e) => {
+            eprintln!("decay curve invariant violated: {}", e);
             exit(1);
         }
     }
