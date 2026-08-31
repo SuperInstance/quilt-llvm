@@ -344,3 +344,92 @@ Ordered by what the experiments actually showed:
   `git log --oneline` (8c14c29 → 8d21e4f at time of writing).
 - `cargo test` green before every commit (64/64 at HEAD).
 - Nothing deleted; archives are renames only (none needed yet).
+
+---
+
+# Appendix B — batten-spike: verified-outcome routing over pass pipelines (2026-08-30)
+
+Code: `experiments/batten-spike/` (zero-dependency Rust crate + pinned
+vendored copy of llvm-fabric @ `2e5469e` — the live llvm-fabric tree had
+uncommitted WIP at spike time and did not compile; the pin keeps this
+reproducible). Run it: `cd experiments/batten-spike && cargo test` (13
+green) && `cargo run --release` (prints everything below; full output
+also at `experiments/batten-spike/run-output.txt`).
+
+## B.1 Setup (all toy, labeled)
+
+- **Corpus:** 800 train / 200 test fabrics from llvm-fabric's seeded fuzz
+  generator (disjoint seed ranges: 1–800, 100000–100199).
+- **Pipelines:** `none`, `fold`, `fold>dce`, `dce>fold`, `full`
+  (= fold>dce>fold>dce, the llvm-fabric default).
+- **Cost (toy):** cells processed = sum of input cell counts per pass run.
+- **Benefit (toy):** relative size reduction; zeroed if output fails the
+  verifier (nothing failed — every pipeline stayed verify-clean on all
+  1000 fabrics, 5000 runs).
+- **Score:** `utility − 0.05 × rel_cost`.
+- **Battens:** one spline per (pipeline × {utility, cost}) over
+  standardized features `[ln(cells), arith_frac, const_frac, depth/cells]`
+  — cheap, one-walk features, no pass runs. Kernel = minimal Rust port of
+  batten-spline's Nadaraya–Watson/RBF estimator (reimplemented, not
+  imported: Python-vs-Rust, and CascadeRouter's one-confidence→3-target
+  API doesn't fit per-candidate argmax; age decay dropped — static corpus).
+  800 × 5 = **4000 verified outcome battens**.
+
+## B.2 Numbers (release build, WSL2, rustc 1.97.1)
+
+Fog-scale sweep, 200 held-out fabrics:
+
+| fog_scale | accuracy vs oracle | regret (mean score) | cost saved vs always-full | trivial baseline |
+|---|---|---|---|---|
+| 0.25 | **123/200 = 61.5%** | 0.0176 | **26.2%** (9827 vs 13310 cells) | 54.0% |
+| 0.50 | 113/200 = 56.5% | 0.0150 | 23.3% | 54.0% |
+| 1.00 | 104/200 = 52.0% | 0.0167 | 22.3% | 54.0% |
+| 2.00 | 92/200 = 46.0% | 0.0188 | 21.8% | 54.0% |
+
+- Trivial baseline = always pick the train-majority pipeline (`dce>fold`).
+- Cost vs the oracle-cheapest choice: 14.3% overhead at fog 0.25
+  (9827 vs 8595 cells).
+- Utility captured at fog 0.25: routed mean 0.7081 vs oracle 0.7155
+  (−1.0%).
+
+## B.3 Where routing fails (the fog analysis)
+
+- The oracle only ever picks two pipelines: `dce>fold` (108) vs
+  `fold>dce` (92). `none`/`fold` never win (the fuzz corpus always
+  contains dead code, so DCE always pays); `full` never wins (same
+  result as the 2-pass pipelines, strictly more work). The routing
+  problem collapsed to a **near-tie binary choice** — mean regret is
+  0.018 precisely because the two candidates are almost equivalent.
+- Misroutes are almost entirely `fold>dce` chosen where `dce>fold` was
+  best (66/77 at fog 0.25). Fog density separates correct from misrouted
+  only at larger kernels: at fog_scale 1.0–2.0, mean fog at misroutes
+  (0.33–0.36) exceeds fog at correct routes (0.26–0.31) — **fog does
+  predict wrongness, the epistemology's core claim, weakly confirmed**.
+  At fog 0.25 the separation vanishes (0.323 vs 0.305) — accuracy there
+  comes from a tighter kernel, not from fog being informative.
+- The 4-dim feature vector under-determines the choice: fabrics with
+  near-identical size/op-mix/depth features get different oracle picks,
+  so some misroutes are feature-space fog that no kernel width fixes.
+
+## B.4 Verdict (undersold)
+
+**In this toy, batten-routing earns only part of its keep.** It beats
+the trivial always-majority policy by +7.5 points (61.5% vs 54.0%) and
+saves 26.2% cost vs always-running-full while capturing 99% of utility —
+but only at the tightest kernel, the margin is thin, and the two
+contenders were near-ties anyway (regret 0.018). Fog density flagged
+failures only in the regime where accuracy was worse. For a real
+compiler, the honest read: routing between near-equivalent pipelines is
+not worth a batten store; routing **cheap-tier vs full-walk verification**
+(REVERSE-ACTUALIZATION §3(a)'s actual cascade) has orders of magnitude
+more cost spread than this toy's 5 pipelines did, which is where the
+method should be retried. Toy caveats, all of them: cell-count cost,
+size-reduction benefit, fuzz corpus (uniform-ish shapes), λ=0.05 chosen
+by hand, feature set hand-picked.
+
+## B.5 Ledger
+
+- `cargo test` green (13/13) before every commit; llvm-fabric vendor pin
+  @ `2e5469e` (76/76 green).
+- Nothing outside `experiments/batten-spike/` touched except this
+  appendix.

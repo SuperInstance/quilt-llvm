@@ -35,12 +35,11 @@ struct Routed {
 struct SplineSet {
     util: Vec<Spline>, // per pipeline
     cost: Vec<Spline>, // per pipeline
-    fog_scale: f64,
 }
 
 impl SplineSet {
     fn fit(train: &[Fab], fog_scale: f64) -> SplineSet {
-        let mut set = SplineSet { util: Vec::new(), cost: Vec::new(), fog_scale };
+        let mut set = SplineSet { util: Vec::new(), cost: Vec::new() };
         for p in PIPELINES {
             let mut su = Spline::new(fog_scale);
             let mut sc = Spline::new(fog_scale);
