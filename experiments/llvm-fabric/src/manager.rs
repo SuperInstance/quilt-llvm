@@ -272,20 +272,79 @@ mod tests {
     }
 
     #[test]
-    fn replay_from_mid_history_is_bit_identical() {
-        // D5 enforcement: replay a PREFIX of the history and compare the
-        // stage at that prefix boundary.
+    fn replay_from_mid_history_is_bit_identical_at_every_prefix() {
+        // D5 at full strength (verification-lane finding: k=2 only was
+        // shallow): replay EVERY prefix boundary, not one.
         let m = PassManager::new();
         let run = m.run_v0(&mix()).unwrap();
-        let k = 2usize; // mid-history boundary
-        let mut prefix = run.history.clone();
-        prefix.records.truncate(k);
-        prefix.weft.truncate(k);
-        let (stages, final_stage) = replay::replay(&run.stages[0], &prefix).unwrap();
-        assert_eq!(stages.len(), k + 1);
-        assert_eq!(stages[k], run.stages[k], "stage at boundary must be bit-identical");
-        assert_eq!(crate::text::print(&stages[k]), crate::text::print(&run.stages[k]));
-        let _ = final_stage;
+        for k in 1..run.stages.len() {
+            let mut prefix = run.history.clone();
+            prefix.records.truncate(k);
+            prefix.weft.truncate(k);
+            let (stages, _) = replay::replay(&run.stages[0], &prefix).unwrap();
+            assert_eq!(stages.len(), k + 1);
+            assert_eq!(stages[k], run.stages[k], "boundary {} must be bit-identical", k);
+            assert_eq!(crate::text::print(&stages[k]), crate::text::print(&run.stages[k]));
+        }
+    }
+
+    fn double_remove_fn(
+        f: &Fabric,
+        _ctx: &TickCtx,
+        _funcs: &BTreeMap<String, Fabric>,
+    ) -> Result<(Fabric, DiffRecord), String> {
+        // structurally invalid diff: two RemoveCell edits for one id,
+        // only one actual removal. Replay reconciliation must reject.
+        let mut g = f.clone();
+        let victim = g
+            .cells()
+            .find(|&id| g.uses_of(id).is_empty() && matches!(g.cell(id).map(|c| &c.kind), Some(CellKind::Const { .. })))
+            .expect("a free const");
+        g.slab[victim.0 as usize] = None;
+        for r in g.regions.iter_mut() {
+            r.cells.retain(|&c| c != victim);
+        }
+        let mut rec = DiffRecord::new("double-remove");
+        for _ in 0..2 {
+            rec.edits.push(Edit::RemoveCell {
+                id: victim,
+                ledger: "removed (twice in the diff)".into(),
+                summary: "%".into(),
+            });
+        }
+        Ok((g, rec))
+    }
+
+    #[test]
+    fn manager_rejects_an_overlapping_diff() {
+        let mut m = PassManager::new();
+        m.register("double-remove", double_remove_fn);
+        let err = m.run(&mix(), &["double-remove"], &BTreeMap::new())
+            .err()
+            .expect("overlapping edits must be rejected");
+        // conserve passes (each removal is ledgered), verify passes —
+        // replay is the layer that refuses to apply the second removal
+        assert!(err.contains("replay"), "{}", err);
+    }
+
+    #[test]
+    fn register_shadowing_is_last_wins_and_visible() {
+        // documented behavior (verification-lane finding): registering
+        // the same name twice overwrites — last registration wins. A
+        // shadowed pass is a config decision, not a silent bypass: the
+        // diff must still record the name it runs under.
+        let mut m = PassManager::new();
+        m.register("leaky", leaky_fn);
+        m.register("leaky", |f, _ctx, _funcs| {
+            // shadow with constfold — re-recorded under the registered
+            // name, or the laundering check rejects it (proved by the
+            // first form of this very test, which failed as designed)
+            let (g, rec) = crate::passes::constfold::const_fold(f)?;
+            Ok((g, DiffRecord { pass: "leaky", epoch: rec.epoch, edits: rec.edits, notes: rec.notes }))
+        });
+        let run = m.run(&mix(), &["leaky"], &BTreeMap::new()).expect("shadowed by constfold");
+        assert!(run.audit[0].advanced, "the shadowing pass actually ran");
+        assert_eq!(run.audit[0].pass, "leaky");
     }
 
     #[test]
@@ -386,6 +445,39 @@ mod tests {
         m.register("fake-fold", laundered_fn);
         let err = m.run(&mix(), &["fake-fold"], &BTreeMap::new()).err().expect("must be rejected");
         assert!(err.contains("laundering"), "{}", err);
+    }
+
+    fn phantom_fn(
+        f: &Fabric,
+        _ctx: &TickCtx,
+        _funcs: &BTreeMap<String, Fabric>,
+    ) -> Result<(Fabric, DiffRecord), String> {
+        // claims a removal it did not perform: the fabric still has the
+        // cell, but the diff says it was removed. Conservation alone
+        // misses this (the removal is listed); REPLAY reconciliation
+        // is what catches a lying diff.
+        let mut rec = DiffRecord::new("phantom");
+        let victim = f.cells().next().expect("nonempty");
+        rec.edits.push(Edit::RemoveCell {
+            id: victim,
+            ledger: "claimed but not done".into(),
+            summary: "%0".into(),
+        });
+        Ok((f.clone(), rec))
+    }
+
+    #[test]
+    fn manager_rejects_a_phantom_edit_via_replay_reconciliation() {
+        let mut m = PassManager::new();
+        m.register("phantom", phantom_fn);
+        let err = m.run(&mix(), &["phantom"], &BTreeMap::new())
+            .err()
+            .expect("phantom edit must be rejected");
+        assert!(
+            err.contains("replay"),
+            "the lying diff is caught by replay reconciliation: {}",
+            err
+        );
     }
 
     #[test]
