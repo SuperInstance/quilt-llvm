@@ -13,6 +13,20 @@ pub const PIPELINE: &[&str] = &["constfold", "dce", "constfold", "dce"];
 /// fold/dce pair, per the scout build order (largest diffs ship last).
 pub const PIPELINE_V1: &[&str] = &["constfold", "dce", "inline", "constfold", "dce"];
 
+/// v2 pipeline: the R2-spike passes graduate in between the v1 pairs —
+/// const-branch fold after the first fold/dce, region-DCE to sweep what
+/// it strands, cfg-inline for the multi-region boundary, then the
+/// closing fold/dce pair cleans up the graft.
+pub const PIPELINE_V2: &[&str] = &[
+    "constfold",
+    "dce",
+    "const-branch-fold",
+    "region-dce",
+    "cfg-inline",
+    "constfold",
+    "dce",
+];
+
 /// Run the pipeline. Returns (final, history, stages) where stages[0] is
 /// the input and stages[i] is the fabric after the i-th pass.
 pub fn run(f: &Fabric) -> Result<(Fabric, History, Vec<Fabric>), String> {
@@ -25,6 +39,15 @@ pub fn run_v1(
     funcs: &BTreeMap<String, Fabric>,
 ) -> Result<(Fabric, History, Vec<Fabric>), String> {
     run_named(f, PIPELINE_V1, funcs)
+}
+
+/// Run the v2 pipeline (PIPELINE_V2) over a program's main fabric with
+/// its callees.
+pub fn run_v2(
+    f: &Fabric,
+    funcs: &BTreeMap<String, Fabric>,
+) -> Result<(Fabric, History, Vec<Fabric>), String> {
+    run_named(f, PIPELINE_V2, funcs)
 }
 
 fn run_named(
@@ -50,6 +73,21 @@ fn run_named(
             }
             "inline" => {
                 let (next, rec) = crate::passes::inline::inline_calls(&cur, funcs)?;
+                cur = next;
+                rec
+            }
+            "const-branch-fold" => {
+                let (next, rec) = crate::passes::const_branch::pass(&cur)?;
+                cur = next;
+                rec
+            }
+            "region-dce" => {
+                let (next, rec) = crate::passes::region_dce::pass(&cur)?;
+                cur = next;
+                rec
+            }
+            "cfg-inline" => {
+                let (next, rec) = crate::passes::cfg_inline::pass(&cur, funcs)?;
                 cur = next;
                 rec
             }
@@ -197,5 +235,76 @@ region entry\n\
             .expect("inline epoch recorded");
         assert!(inline_rec.edits.iter().any(|e| matches!(e,
             crate::diff::Edit::RemoveCell { ledger, .. } if ledger.contains("inlined 'add2'"))));
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+    use crate::conserve;
+    use crate::replay;
+    use crate::verify::verify;
+
+    /// the v1_tests program: main calls add2(20, 22) with a dead const
+    /// alongside — enough to keep every v2 stage honest (dce fires
+    /// early, cfg-inline grafts, the closing fold/dce collapses the
+    /// graft to const 42).
+    fn prog() -> (Fabric, BTreeMap<String, Fabric>) {
+        let main_text = "fabric v0\n\
+region entry\n\
+  %0 = param i32\n\
+  %1 = const i32 20\n\
+  %2 = const i32 22\n\
+  %3 = const i64 9i64\n\
+  %4 = call i32 add2 %1, %2\n\
+  %5 = ret %4\n";
+        let callee_text = "fabric v0\n\
+region entry\n\
+  %0 = param i32\n\
+  %1 = param i32\n\
+  %2 = arith.add i32 %0, %1\n\
+  %3 = ret %2\n";
+        let mut funcs = BTreeMap::new();
+        funcs.insert("add2".to_string(), crate::text::parse(callee_text).unwrap());
+        (crate::text::parse(main_text).unwrap(), funcs)
+    }
+
+    #[test]
+    fn v2_pipeline_conserves_verifies_and_replays_every_stage() {
+        let (f, funcs) = prog();
+        let (final_f, history, stages) = run_v2(&f, &funcs).unwrap();
+        assert_eq!(stages.len(), 8, "7 passes = 8 stages");
+        assert!(verify(&final_f).is_ok());
+        assert!(conserve::check_pipeline(&f, &final_f, &history).is_ok());
+        // the graduated passes ran their epochs in order
+        let names: Vec<&str> = history.records.iter().map(|r| r.pass).collect();
+        assert_eq!(
+            names,
+            vec!["constfold", "dce", "const-branch-fold", "region-dce", "cfg-inline", "constfold", "dce"]
+        );
+        // the payoff: the call grafted and then folded through — ret
+        // ends up fed by const 42
+        let ret_id = final_f
+            .cells()
+            .find(|&id| matches!(final_f.cell(id).map(|c| &c.kind), Some(crate::cell::CellKind::Ret)))
+            .expect("ret survives");
+        let fed = final_f.cell(ret_id).unwrap().operands[0];
+        assert_eq!(
+            final_f.cell(fed).unwrap().kind,
+            crate::cell::CellKind::Const {
+                ty: crate::ty::Type::I32,
+                val: crate::ty::ConstVal::I32(42)
+            },
+            "fold crossed the cfg-inline graft"
+        );
+        // replay reproduces every stage bit-identically (the R2 spike's
+        // 0/140 and 0/34 gaps stay closed at pipeline scale)
+        let (replayed, final_r) = replay::replay(&f, &history).unwrap();
+        assert_eq!(replayed.len(), stages.len());
+        for (i, (a, b)) in stages.iter().zip(replayed.iter()).enumerate() {
+            assert_eq!(a, b, "stage {}", i);
+            assert_eq!(crate::text::print(a), crate::text::print(b), "stage {} text", i);
+        }
+        assert_eq!(final_f, final_r);
     }
 }

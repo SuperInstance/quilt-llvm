@@ -3,6 +3,10 @@
 //! Passes refuse unverified input and must leave verified, conserving
 //! output (tested).
 
+pub mod cfg_inline;
+pub mod const_branch;
 pub mod constfold;
 pub mod dce;
 pub mod inline;
+pub mod region_dce;
+pub mod verdict;
