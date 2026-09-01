@@ -164,3 +164,17 @@ by `verify` or by the IR itself; no breeding pressure can emit them
 — R2 wide-lane subagent, 2026-08-30. Engine lineage: mud-arena
 `evolve.py` (tournament/elite/breed/mutate/replace-worst/history),
 ported to fabric IR; no runtime dependency on mud-arena.
+
+---
+
+**R3 addendum (2026-08-31):** two of this spike's shapes did not
+survive R3 lane 2 — see `R3-LANE2-GA-CALLEES.md`. (1) REGION-SPIKE
+§3.3's “0/140 bred callees” ratchet is fixed: mutation/crossover now
+preserve entry-acyclicity (non-entry back-edge targets, sink clamp,
+rejection guard, callee fitness bonus) and the default run measures
+140/200 final-population inline-eligible callees, 140/140 green under
+pipeline+population_audit. (2) The verify pass-rate and dead-region
+numbers above are spike-era; current runs measure 71–80% verify by
+seed and 58 dead regions (the 691-corpse era was the ratchet's twin —
+§5.2 of the lane doc). The C-item table's shape (8 reachable, 3
+unreachable, first-cover by gen ≤1) still reproduces.
