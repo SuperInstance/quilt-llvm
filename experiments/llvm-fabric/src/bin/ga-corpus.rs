@@ -34,7 +34,7 @@ fn main() {
     );
 
     let t0 = std::time::Instant::now();
-    let rep = ga::run(&cfg);
+    let (rep, bred) = ga::run_keep(&cfg);
     let dt = t0.elapsed();
 
     // per-generation coverage trace of population item-counts
@@ -81,6 +81,33 @@ fn main() {
         100.0 * last.verify_pass as f64 / cfg.population as f64);
     println!("best coverage: {} items, fitness {:.1}", rep.best_coverage.n_items(), rep.best_fitness);
     println!("total evaluations: {}  wall time: {:.2}s", rep.total_evals, dt.as_secs_f64());
+
+    // R3 lane 2 exit — callee material in the bred population (the
+    // number REGION-SPIKE §3.3 measured as 0/140 that starved pass C)
+    println!("\n== R3 lane 2 exit: callee material in the FINAL population ==");
+    println!("entry-acyclic fabrics:       {}/{}", rep.entry_acyclic, cfg.population);
+    println!("inline-eligible bred callees (verify+acyclic entry+uniform rets): {}", rep.bred_callees);
+    println!("acyclicity-guard refusals (expected 0; tripwire for future operators): {}", rep.acyclicity_rejections);
+
+    // conservation battery over the bred population (the R2 cocapn
+    // population_audit, wired per-tick in pipeline::run — same law the
+    // plain corpus runs under, now stated for the bred corpus too)
+    let mut pipe_ok = 0usize;
+    let mut pipe_total = 0usize;
+    for f in &bred {
+        if llvm_fabric::verify::verify(f).is_err() {
+            continue;
+        }
+        pipe_total += 1;
+        if llvm_fabric::pipeline::run(f).is_ok() {
+            pipe_ok += 1;
+        }
+    }
+    println!(
+        "bred corpus under pipeline+population_audit: {}/{} verify-green fabrics pass green",
+        pipe_ok,
+        pipe_total.max(1)
+    );
 
     // honesty check: breed a fresh population and count text round-trips
     // (the corpus harness demands print/parse/print stability; bred

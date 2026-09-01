@@ -204,14 +204,63 @@ pub fn coverage(f: &Fabric) -> Coverage {
 
 /// Fitness: 0 if verify fails; else 10 per C-item + capped depth
 /// bonuses (tiebreakers that keep the GA deepening, never dominating
-/// an extra item).
+/// an extra item). R3 lane 2 adds a callee-material bonus (max +5.0,
+/// half an item): entry-acyclicity is a one-way ratchet under mutation
+/// (no operator removes ctrl edges), so without selection pressure the
+/// ~17% of gen-0 seeds that are entry-clean drift extinct and the
+/// inline/graft passes starve (REGION-SPIKE §3.3: 0/140 bred callees).
+/// +2.5 for an entry with no predecessors, +2.5 more for the full
+/// fabric-level callee predicate (uniform single-value rets).
 pub fn fitness(f: &Fabric) -> f64 {
     if verify(f).is_err() {
         return 0.0;
     }
     let cov = coverage(f);
-    10.0 * cov.n_items() as f64
-        + (cov.phi_consumers.min(10) + cov.calls.min(5) + cov.boundary_consts.min(5)) as f64 * 0.5
+    let mut fit = 10.0 * cov.n_items() as f64
+        + (cov.phi_consumers.min(10) + cov.calls.min(5) + cov.boundary_consts.min(5)) as f64 * 0.5;
+    if entry_acyclic(f) {
+        fit += 2.5;
+        if callee_eligible(f).is_some() {
+            fit += 2.5;
+        }
+    }
+    fit
+}
+
+/// True iff no ctrl edge targets the entry region — the fabric half of
+/// inline-callee eligibility (cfg_graft_inline skips cyclic-at-entry
+/// callees). Cheap: one table lookup.
+pub fn entry_acyclic(f: &Fabric) -> bool {
+    f.predecessors(RegionId(0)).is_empty()
+}
+
+/// The fabric-level half of the region spike's inline-eligibility
+/// predicate (region-spike.rs `inline_eligible_callee`, verbatim
+/// semantics): verify green + entry-acyclic + every ret returns exactly
+/// one value of one common type. Returns the common ret type. The
+/// call-site half (arity, entry-only call, declared type match) is
+/// program assembly, downstream of the corpus.
+pub fn callee_eligible(f: &Fabric) -> Option<Type> {
+    if verify(f).is_err() {
+        return None;
+    }
+    if !entry_acyclic(f) {
+        return None;
+    }
+    let mut ty: Option<Type> = None;
+    for id in f.cells() {
+        if let Some(c) = f.cell(id) {
+            if let CellKind::Ret = &c.kind {
+                let t = c.operands.first().and_then(|&o| f.ty_of(o))?;
+                match ty {
+                    None => ty = Some(t),
+                    Some(t0) if t0 == t => {}
+                    _ => return None,
+                }
+            }
+        }
+    }
+    ty
 }
 
 // ----------------------------------------------------------------------
@@ -352,12 +401,19 @@ pub fn mut_consume_phi(f: &Fabric, rng: &mut Rng) -> Fabric {
         Some(t) => t,
         None => return g,
     };
-    // variant: i1 phi → existing branch cond in the same region
+    // variant: i1 phi → existing branch cond in the same region.
+    // R3 lane 2: through the sanctioned retarget — a raw operands write
+    // here (the spike's version) bypassed the use tables and left
+    // stale users rows; constfold then missed the branch as a user of
+    // the old cond and later bred fabrics reached dce with V01
+    // dangling operands (measured: ~8% of verify-green bred fabrics).
     if ty == Type::I1 && rng.chance(40) {
         if let Some(&last) = g.region(r).and_then(|x| x.cells.last()) {
-            if let Some(c) = g.cell_mut(last) {
-                if matches!(c.kind, CellKind::Branch { .. }) {
-                    c.operands = vec![phi];
+            if matches!(g.cell(last).map(|c| &c.kind), Some(CellKind::Branch { .. })) {
+                if g.cell(last).map(|c| c.operands.first().copied()) == Some(Some(phi)) {
+                    return g; // already wired
+                }
+                if g.retarget(last, 0, phi).is_some() {
                     return g;
                 }
             }
@@ -462,12 +518,20 @@ pub fn mut_grow(f: &Fabric, rng: &mut Rng) -> Fabric {
     }
     match rng.below(3) {
         0 => {
-            // new region jumping back somewhere (adds region + edge)
-            let target = RegionId(rng.below(g.regions.len() as u64) as u32);
+            // new region jumping back somewhere (adds region + edge).
+            // R3 lane 2: the back-edge target must NOT be the entry —
+            // entry predecessors are a one-way ratchet (no operator
+            // removes ctrl edges) and they destroy inline-callee
+            // eligibility wholesale. With >1 region, target a non-entry
+            // region; with only entry, the new region self-loops (still
+            // grows the region and edge counts — the C10 pressure this
+            // operator exists for).
+            let n = g.regions.len() as u64;
             let r = g.add_region(format!("ga{}", g.regions.len()));
+            let target = if n > 1 { RegionId(1 + rng.below(n - 1) as u32) } else { r };
             let v = g.add_cell(r, Cell::new(r, CellKind::Const { ty: Type::I32, val: ConstVal::I32(1) }));
-            g.add_cell(r, Cell::new(r, CellKind::Jump { target }));
             let _ = v;
+            g.add_cell(r, Cell::new(r, CellKind::Jump { target }));
         }
         1 => {
             // append a small arith chain before some region's terminator
@@ -551,14 +615,13 @@ pub fn mut_operand_shuffle(f: &Fabric, rng: &mut Rng) -> Fabric {
         None => return g,
     };
     let pool = visible_values(&g, r, pos, ty);
-    // prefer a non-latest pick when one exists
+    // prefer a non-latest pick when one exists. R3 lane 2: through the
+    // sanctioned retarget — the spike's raw slot write bypassed the
+    // use tables (stale users rows → constfold V01 dangling operands
+    // on bred fabric; see mut_consume_phi's note).
     if pool.len() >= 2 {
         let i = rng.below((pool.len() - 1) as u64) as usize; // excludes the last
-        if let Some(c) = g.cell_mut(a) {
-            if let Some(slot0) = c.operands.first_mut() {
-                *slot0 = pool[i];
-            }
-        }
+        let _ = g.retarget(a, 0, pool[i]);
     }
     g
 }
@@ -582,8 +645,17 @@ pub fn mutate_breed(f: &Fabric, rng: &mut Rng) -> Fabric {
 // regions onto a clone of A: operand ids remapped inside the graft,
 // entry values substituted with same-typed child-entry values (or
 // fresh consts), phis with joins outside the graft dropped, terminator
-// targets outside the graft clamped to the child's entry. Broken
+// targets outside the graft clamped to a fresh sink region. Broken
 // children simply score 0 and die — selection is the repair pass.
+//
+// R3 lane 2: the clamp target used to be the child's ENTRY, which
+// minted a back-edge into entry on every crossover child whose graft
+// terminators escaped the graft — the single largest source of the
+// entry-cyclicity pressure that starved the inline/graft passes of
+// callee material (REGION-SPIKE §3.3: 0/140 bred callees). The clamp
+// now lands in a lazily-created sink region (a void ret — verify-
+// legal, unreachable, harmless): entry-acyclicity of parent A is
+// inherited exactly.
 // ----------------------------------------------------------------------
 
 pub fn crossover(a: &Fabric, b: &Fabric, rng: &mut Rng) -> Fabric {
@@ -595,6 +667,20 @@ pub fn crossover(a: &Fabric, b: &Fabric, rng: &mut Rng) -> Fabric {
     let start = 1 + rng.below((n - 1) as u64) as usize;
     let count = 1 + rng.below((n - start) as u64) as usize;
     let graft: Vec<usize> = (start..(start + count).min(n)).collect();
+
+    // lazily-created clamp target for graft terminators that escape
+    // the graft (created on first use — children whose grafts are
+    // self-contained pay nothing)
+    let mut sink: Option<RegionId> = None;
+    let mut sink_of = |child: &mut Fabric| -> RegionId {
+        if let Some(s) = sink {
+            return s;
+        }
+        let s = child.add_region("ga_sink");
+        child.add_cell(s, Cell::new(s, CellKind::Ret));
+        sink = Some(s);
+        s
+    };
 
     // map b-region-idx -> child RegionId
     let mut region_map: BTreeMap<u32, RegionId> = BTreeMap::new();
@@ -705,14 +791,15 @@ pub fn crossover(a: &Fabric, b: &Fabric, rng: &mut Rng) -> Fabric {
         for (bid, mut cell) in body {
             let is_term = cell.is_terminator();
             if is_term {
-                // remap terminator targets into child space
+                // remap terminator targets into child space: inside the
+                // graft stays; outside clamps to the sink, NEVER entry
                 match &mut cell.kind {
                     CellKind::Jump { target } => {
-                        *target = region_map.get(&target.0).copied().unwrap_or(RegionId(0));
+                        *target = region_map.get(&target.0).copied().unwrap_or_else(|| sink_of(&mut child));
                     }
                     CellKind::Branch { then_r, else_r } => {
-                        *then_r = region_map.get(&then_r.0).copied().unwrap_or(RegionId(0));
-                        *else_r = region_map.get(&else_r.0).copied().unwrap_or(RegionId(0));
+                        *then_r = region_map.get(&then_r.0).copied().unwrap_or_else(|| sink_of(&mut child));
+                        *else_r = region_map.get(&else_r.0).copied().unwrap_or_else(|| sink_of(&mut child));
                     }
                     _ => {}
                 }
@@ -777,6 +864,17 @@ pub struct RunReport {
     pub best_coverage: Coverage,
     pub best_fitness: f64,
     pub total_evals: usize,
+    /// R3 lane 2 — callee material, measured on the FINAL population:
+    /// fabrics with an entry-acyclic entry region, and fabrics passing
+    /// the full fabric-level inline-callee predicate.
+    pub entry_acyclic: usize,
+    pub bred_callees: usize,
+    /// times the acyclicity guard refused a bred child that would have
+    /// newly polluted a clean parent's entry. With the R3 operators
+    /// this is expected to be 0 — it exists so a future operator that
+    /// reintroduces the pressure is COUNTED, not silent (the GA still
+    /// preserves acyclicity either way; the counter is the tripwire).
+    pub acyclicity_rejections: usize,
 }
 
 pub fn run(cfg: &GaConfig) -> RunReport {
@@ -800,6 +898,7 @@ fn run_inner(cfg: &GaConfig) -> (RunReport, Vec<Fabric>) {
     let mut total_evals = 0usize;
     let mut best_fabric = population[0].clone();
     let mut best_fitness = -1.0;
+    let mut acyclicity_rejections = 0usize;
 
     for gen in 0..cfg.generations {
         // evaluate
@@ -852,15 +951,34 @@ fn run_inner(cfg: &GaConfig) -> (RunReport, Vec<Fabric>) {
                 .collect::<Vec<_>>();
             let pa = *tourney.iter().max_by_key(|&&i| fits[i].to_bits()).expect("nonempty");
             let pb = *tourney.iter().max_by_key(|&&i| fits[i].to_bits()).expect("nonempty");
-            let child = if rng.chance(60) && pa != pb {
-                crossover(&population[pa], &population[pb], &mut rng)
+            // R3 lane 2 — acyclicity guard: a child of an entry-clean
+            // parent must stay entry-clean. The operators are designed
+            // never to pollute entry (mut_grow targets non-entry,
+            // crossover clamps to a sink); this rejection-sampling
+            // backstop catches anything they miss: a polluting child is
+            // refused (parent carries on unchanged) and the refusal is
+            // counted. Children of cyclic parents are untouched — the
+            // guard preserves, it never launders.
+            let parent_clean = entry_acyclic(&population[pa]);
+            let mut child = if rng.chance(60) && pa != pb {
+                let crossed = crossover(&population[pa], &population[pb], &mut rng);
+                if parent_clean && !entry_acyclic(&crossed) {
+                    acyclicity_rejections += 1;
+                    population[pa].clone()
+                } else {
+                    crossed
+                }
             } else {
                 population[pa].clone()
             };
             let n_mut = 1 + rng.below(3);
-            let mut child = child;
             for _ in 0..n_mut {
-                child = mutate_breed(&child, &mut rng);
+                let cand = mutate_breed(&child, &mut rng);
+                if parent_clean && !entry_acyclic(&cand) {
+                    acyclicity_rejections += 1;
+                    continue; // keep the unmutated child; skip this draw
+                }
+                child = cand;
             }
             next.push(child);
         }
@@ -879,7 +997,10 @@ fn run_inner(cfg: &GaConfig) -> (RunReport, Vec<Fabric>) {
         coverage(&population[bi])
     };
 
-    let rep = RunReport { gens, first_covered, max_item_counts, best_coverage, best_fitness, total_evals };
+    let entry_acyclic_n = population.iter().filter(|f| entry_acyclic(f)).count();
+    let bred_callees = population.iter().filter(|f| callee_eligible(f).is_some()).count();
+
+    let rep = RunReport { gens, first_covered, max_item_counts, best_coverage, best_fitness, total_evals, entry_acyclic: entry_acyclic_n, bred_callees, acyclicity_rejections };
     (rep, population)
 }
 
@@ -1016,5 +1137,143 @@ mod tests {
         f.slab[0] = None; // punch a hole
         assert_eq!(fitness(&f), 0.0);
         assert!(fitness(&diamond(1)) >= 0.0);
+    }
+
+    // ------------------------------------------------------------------
+    // R3 lane 2 — entry-acyclicity preservation + bred callee material
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn callee_eligibility_predicate_semantics() {
+        // the audit-shaped diamond: entry-acyclic, single typed ret
+        let f = diamond(1);
+        assert_eq!(callee_eligible(&f), Some(Type::I32));
+        assert!(entry_acyclic(&f));
+        assert!(fitness(&f) > 10.0 * coverage(&f).n_items() as f64, "eligible fabric earns the callee bonus");
+
+        // entry-cyclic: a second region jumps back into entry
+        let text = "fabric v0\n\
+                    region entry\n\
+                      %0 = const i1 true\n\
+                      %1 = br %0, t, el\n\
+                    region t\n\
+                      %2 = const i32 1\n\
+                      %3 = jump el\n\
+                    region el\n\
+                      %4 = jump entry\n";
+        let g = crate::text::parse(text).expect("cyclic fabric parses");
+        assert!(verify(&g).is_ok(), "entry-cyclic fabrics verify green — the ratchet is legal");
+        assert!(!entry_acyclic(&g));
+        assert_eq!(callee_eligible(&g), None, "cyclic-at-entry is not callee material");
+
+        // uniform-ret violation: a void ret alongside a typed one
+        let text = "fabric v0\n\
+                    region entry\n\
+                      %0 = const i1 true\n\
+                      %1 = br %0, t, el\n\
+                    region t\n\
+                      %2 = const i32 1\n\
+                      %3 = ret\n\
+                    region el\n\
+                      %4 = const i32 2\n\
+                      %5 = ret %4\n";
+        let h = crate::text::parse(text).expect("void-ret fabric parses");
+        assert!(verify(&h).is_ok(), "void rets are legal fabrics — just not callee material");
+        assert_eq!(callee_eligible(&h), None, "void ret breaks uniform rets");
+    }
+
+    #[test]
+    fn mutation_and_crossover_preserve_entry_acyclicity() {
+        // the lane's core invariant, exercised directly on the
+        // operators (no engine): descendants of an entry-clean fabric
+        // stay entry-clean through any number of mutation draws and
+        // crossovers — including crossovers with entry-CYCLIC partners
+        // (the ratchet must not be imported through a graft).
+        let mut rng = Rng::new(0xAC1C);
+        let mut clean: Vec<Fabric> = vec![diamond(7), diamond(11)];
+        for i in 0..40u64 {
+            let f = crate::fuzz::gen_fabric(&mut Rng::new(0x600D + i));
+            if entry_acyclic(&f) {
+                clean.push(f);
+            }
+        }
+        assert!(clean.len() >= 8, "expected several clean seeds, got {}", clean.len());
+
+        // cyclic partners, for crossover pressure
+        let cyclic: Vec<Fabric> = (0..40u64)
+            .map(|i| crate::fuzz::gen_fabric(&mut Rng::new(0xBADC0DE + i)))
+            .filter(|f| !entry_acyclic(f))
+            .collect();
+        assert!(!cyclic.is_empty());
+
+        let mut verified_children = 0usize;
+        const GENS: usize = 30;
+        let mut lineage = clean;
+        for _gen in 0..GENS {
+            let mut next = vec![];
+            for (i, f) in lineage.iter().enumerate() {
+                assert!(
+                    entry_acyclic(f),
+                    "lineage fabric {} polluted before gen end",
+                    i
+                );
+                let mut child = f.clone();
+                // 3 mutation draws per generation (engine uses 1..=3)
+                for _ in 0..3 {
+                    child = mutate_breed(&child, &mut rng);
+                    assert!(
+                        entry_acyclic(&child),
+                        "mutate_breed polluted a clean entry (fabric {})",
+                        i
+                    );
+                }
+                // crossover pressure: clean x cyclic and clean x clean
+                if let Some(p) = rng.pick(&cyclic) {
+                    let crossed = crossover(&child, p, &mut rng);
+                    assert!(entry_acyclic(&crossed), "crossover imported entry preds from a cyclic partner");
+                    child = crossed;
+                }
+                if let Some(p) = rng.pick(&lineage) {
+                    let crossed = crossover(&child, p, &mut rng);
+                    assert!(entry_acyclic(&crossed));
+                    child = crossed;
+                }
+                if verify(&child).is_ok() {
+                    verified_children += 1;
+                }
+                next.push(child);
+            }
+            lineage = next;
+        }
+        assert!(
+            verified_children > 0,
+            "fix made mutations all-invalid: {} verify-green children in {} gens",
+            verified_children,
+            GENS
+        );
+    }
+
+    #[test]
+    fn engine_breeds_callees_and_guard_stays_silent() {
+        // the lane's exit criterion, at test scale: the GA's FINAL
+        // population contains inline-eligible bred callees (>0), the
+        // guard never had to refuse anything (operators preserve
+        // acyclicity by construction — the counter is a tripwire), and
+        // the report's counts match a manual recount of the population.
+        let cfg = GaConfig { population: 100, generations: 25, elite: 20, tournament: 5, seed: 0x6A1C0 };
+        let (rep, pop) = run_keep(&cfg);
+        assert_eq!(rep.acyclicity_rejections, 0, "operators regressed: the guard fired");
+        assert!(rep.entry_acyclic > 0, "clean lines drifted extinct");
+        assert!(rep.bred_callees > 0, "no bred callee material in the final population");
+        // recount: the report must be measured, not aspirational
+        let n_acyclic = pop.iter().filter(|f| entry_acyclic(f)).count();
+        let n_callees = pop.iter().filter(|f| callee_eligible(f).is_some()).count();
+        assert_eq!(rep.entry_acyclic, n_acyclic);
+        assert_eq!(rep.bred_callees, n_callees);
+        // every reported callee is genuinely eligible AND verifies
+        for f in pop.iter().filter(|f| callee_eligible(f).is_some()) {
+            assert!(verify(f).is_ok());
+            assert!(f.predecessors(RegionId(0)).is_empty());
+        }
     }
 }
