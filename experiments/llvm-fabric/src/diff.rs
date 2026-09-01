@@ -6,7 +6,7 @@
 //! paper trail (see conserve.rs).
 
 use crate::cell::Cell;
-use crate::id::CellId;
+use crate::id::{CellId, RegionId};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Edit {
@@ -18,6 +18,28 @@ pub enum Edit {
     RemoveCell { id: CellId, ledger: String, summary: String },
     /// Rewire one use: operands[slot] of `cell` goes from `from` to `to`.
     Retarget { cell: CellId, slot: u32, from: CellId, to: CellId },
+    /// Add an empty region under an explicit (fresh) id.
+    /// Invariant: id == fabric.regions.len() at apply time (region ids
+    /// append-only, exactly like AddCell's slab law). The R3
+    /// region-granular vocabulary (REGION-SPIKE §4.2: the kinds the
+    /// spike proved necessary — region compaction, cell moves, join
+    /// relabels had NO Edit kind, so region-DCE replayed 0/140).
+    RegionAdded { id: RegionId, name: String },
+    /// Remove region `id` (must be EMPTY at apply time — its cells
+    /// ride their own RemoveCell edits) and compact every region id
+    /// above it down by one, remapping every surviving reference
+    /// (cell.region, Jump/Branch targets, phi joins). `name` is the
+    /// anti-forgery twin of Retarget's `from`: it must match the
+    /// region being removed.
+    RegionRemoved { id: RegionId, name: String },
+    /// Move a cell (id stable) from region `from` to region `to` at
+    /// `index` (clamped like AddCell's). `from` is validated against
+    /// the fabric, exactly like Retarget's `from`.
+    MoveCell { id: CellId, from: RegionId, to: RegionId, index: usize },
+    /// Relabel one phi join `from` -> `to` (same edge, new source —
+    /// the inline continuation's join relabel). Only the label moves;
+    /// operands and use wires are untouched.
+    RelabelJoin { phi: CellId, from: RegionId, to: RegionId },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -68,6 +90,29 @@ impl DiffRecord {
                 }
                 Edit::Retarget { cell, slot, from, to } => {
                     out.push_str(&format!("  ~ {}.{}: {} -> {}\n", cell, slot, from, to));
+                }
+                Edit::RegionAdded { id, name } => {
+                    out.push_str(&format!("  + region {} '{}'\n", id, name));
+                }
+                Edit::RegionRemoved { id, name } => {
+                    out.push_str(&format!("  - region {} '{}' (ids compacted)\n", id, name));
+                }
+                Edit::MoveCell { id, from, to, index } => {
+                    out.push_str(&format!(
+                        "  ~ {}: {} -> {}[{}]\n",
+                        id,
+                        f.region_name(*from),
+                        f.region_name(*to),
+                        index
+                    ));
+                }
+                Edit::RelabelJoin { phi, from, to } => {
+                    out.push_str(&format!(
+                        "  ~ {}: join {} -> {}\n",
+                        phi,
+                        f.region_name(*from),
+                        f.region_name(*to)
+                    ));
                 }
             }
         }
@@ -271,6 +316,12 @@ impl History {
                     }
                     Edit::Retarget { cell: c, slot, from, to } if *c == id => {
                         Some(format!("retargeted use .{} {} -> {}", slot, from, to))
+                    }
+                    Edit::MoveCell { id: i, from, to, .. } if *i == id => {
+                        Some(format!("moved region {} -> {}", from, to))
+                    }
+                    Edit::RelabelJoin { phi: p, from, to } if *p == id => {
+                        Some(format!("join relabeled {} -> {}", from, to))
                     }
                     _ => None,
                 };

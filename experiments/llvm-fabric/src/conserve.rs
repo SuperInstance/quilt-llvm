@@ -111,6 +111,13 @@ pub fn population_audit(
                     ));
                 }
             }
+            // Region-granular kinds are population-neutral by design:
+            // cells ride their own Add/RemoveCell edits (a RegionRemoved
+            // carrying cells is rejected by replay before any audit).
+            Edit::RegionAdded { .. }
+            | Edit::RegionRemoved { .. }
+            | Edit::MoveCell { .. }
+            | Edit::RelabelJoin { .. } => {}
         }
     }
     for id in &removed_ids {
@@ -135,30 +142,46 @@ pub fn population_audit(
             return Err(format!("phantom add: {} recorded but absent after the tick", id));
         }
     }
-    // Summary truth: reconstruct each removed cell as the pass saw it —
-    // the before fabric plus this record's own retargets (constfold
-    // retargets a user before folding it in the same tick).
+    // Summary truth: reconstruct each removed cell as the pass saw it
+    // — a single walk of the record's own edits IN ORDER, rendering
+    // every RemoveCell summary at its stream position (the state the
+    // pass saw when it rendered it). Retargets stay soft (a no-op on
+    // mismatch, as before); AddCell and the region-granular kinds go
+    // through apply_edit so later summaries reproduce across id
+    // compaction, cell moves, and join relabels — and a RegionRemoved
+    // finds its region emptied of the cells the record already
+    // ledgered out.
     if !removed_ids.is_empty() {
         let mut ctx = before.clone();
         for e in &rec.edits {
-            if let Edit::Retarget { cell, slot, from, to } = e {
-                if let Some(c) = ctx.cell_mut(*cell) {
-                    if let Some(op) = c.operands.get_mut(*slot as usize) {
-                        if *op == *from {
-                            *op = *to;
+            match e {
+                Edit::RemoveCell { id, summary, .. } => {
+                    let truth = crate::text::render_cell(&ctx, *id);
+                    if *summary != truth {
+                        return Err(format!(
+                            "lying summary: {} recorded as {:?} but the cell was {:?}",
+                            id, summary, truth
+                        ));
+                    }
+                    let _ = ctx.remove_cell(*id);
+                }
+                Edit::Retarget { cell, slot, from, to } => {
+                    if let Some(c) = ctx.cell_mut(*cell) {
+                        if let Some(op) = c.operands.get_mut(*slot as usize) {
+                            if *op == *from {
+                                *op = *to;
+                            }
                         }
                     }
                 }
-            }
-        }
-        for e in &rec.edits {
-            if let Edit::RemoveCell { id, summary, .. } = e {
-                let truth = crate::text::render_cell(&ctx, *id);
-                if *summary != truth {
-                    return Err(format!(
-                        "lying summary: {} recorded as {:?} but the cell was {:?}",
-                        id, summary, truth
-                    ));
+                Edit::AddCell { .. }
+                | Edit::RegionAdded { .. }
+                | Edit::RegionRemoved { .. }
+                | Edit::MoveCell { .. }
+                | Edit::RelabelJoin { .. } => {
+                    crate::replay::apply_edit(&mut ctx, e).map_err(|err| {
+                        format!("record is not self-consistent: {}", err)
+                    })?;
                 }
             }
         }

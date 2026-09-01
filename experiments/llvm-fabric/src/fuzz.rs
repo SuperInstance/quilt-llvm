@@ -491,6 +491,8 @@ pub struct CorpusStats {
     pub weft_fail: u64, // signature-chain / progress-law failures
     pub replay_fail: u64,
     pub tables_fail: u64, // maintained != derived use/pred/succ tables (R2)
+    pub region_dce_green: u64, // R3 lane 1: region-dce ran green (tables + replay law held)
+    pub region_dce_refused: u64, // the named §3.1 refusal class — counted, never failed
     pub panics: u64, // can only be observed as a test/bin crash; kept for the report
 }
 
@@ -610,6 +612,56 @@ pub fn corpus_run(iters: u64, seed0: u64) -> Result<CorpusStats, String> {
             Err(e) => return Err(format!("seed {}: pipeline failed on valid fabric: {}", seed, e)),
         }
 
+        // R3 lane 1 (the region-edit vocabulary under the same laws):
+        // region_dce on the generated fabric — the maintained tables
+        // must stay derivable on the result and on EVERY replayed
+        // stage, and the edit stream (RemoveCell + RegionRemoved) must
+        // reproduce the fabric bit-identically. The named refusal
+        // class (a live phi's only join on the dying region with a
+        // non-const cross-region operand — REGION-SPIKE §3.1) is
+        // counted honestly, never treated as a failure.
+        match crate::region::region_dce(&f) {
+            Ok((g2, rec2, _rdce_stats)) => {
+                if crate::usetables::UseTables::derive(&g2) != g2.tables {
+                    st.tables_fail += 1;
+                    return Err(format!("seed {}: region-dce result tables diverged from derivation", seed));
+                }
+                let mut h2 = crate::diff::History::new();
+                h2.push(rec2);
+                match crate::replay::replay(&f, &h2) {
+                    Ok((stages2, final2)) => {
+                        if final2 != g2 {
+                            st.replay_fail += 1;
+                            return Err(format!("seed {}: region-dce replay diverged from the pass", seed));
+                        }
+                        for s in &stages2 {
+                            if crate::usetables::UseTables::derive(s) != s.tables {
+                                st.tables_fail += 1;
+                                return Err(format!(
+                                    "seed {}: region-dce replayed stage tables diverged from derivation",
+                                    seed
+                                ));
+                            }
+                        }
+                        if let Err(e) = crate::conserve::check(&f, &g2, &h2.records[0]) {
+                            return Err(format!("seed {}: region-dce conservation: {}", seed, e));
+                        }
+                    }
+                    Err(e) => {
+                        st.replay_fail += 1;
+                        return Err(format!("seed {}: region-dce replay failed: {}", seed, e));
+                    }
+                }
+                st.region_dce_green += 1;
+            }
+            Err(e) if e.contains("cannot legally replace") => {
+                st.region_dce_refused += 1;
+            }
+            Err(e) => {
+                return Err(format!("seed {}: region_dce unexpected failure: {}", seed, e));
+            }
+        }
+
         // mutations: verify must reject or accept WITH a reason-free panic never occurring
         if rng.chance(45) {
             let n = 1 + rng.below(3);
@@ -646,6 +698,14 @@ mod tests {
         assert_eq!(st.weft_fail, 0, "weft law + chain must hold on every pipeline run");
         assert_eq!(st.replay_fail, 0);
         assert_eq!(st.tables_fail, 0, "maintained tables must stay derivable (R2 law)");
+        // R3 lane 1: every fabric either ran region-dce green or hit the
+        // named §3.1 refusal — nothing else is acceptable
+        assert_eq!(
+            st.region_dce_green + st.region_dce_refused,
+            st.valid,
+            "region-dce must run green or refuse by the named class on every fabric"
+        );
+        assert!(st.region_dce_green > 0, "the corpus must exercise region-dce removals");
         assert!(st.phis > 0, "generator must actually produce phis (v0 dead-step regression guard)");
         assert!(st.mutated > 0, "mutations must actually happen");
         assert!(
