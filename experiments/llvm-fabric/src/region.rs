@@ -194,6 +194,10 @@ pub fn region_remove(f: &Fabric, r: RegionId) -> Result<(Fabric, DiffRecord), St
         f.region_name(r),
         r.0 + 1
     ));
+    // raw slab/Vec surgery above bypasses the maintained use/pred/succ
+    // tables (R2 use-tables contract): re-derive before returning —
+    // verify's V06 and reachable_regions both read the tables
+    g.rebuild_tables();
     Ok((g, rec))
 }
 
@@ -989,6 +993,10 @@ pub fn region_dce(f: &Fabric) -> Result<(Fabric, DiffRecord, RegionDceStats), St
             "{} dead regions removed, region ids compacted — NOT expressible in the Edit vocabulary (no RegionRemoved kind)",
             dead.len()
         ));
+        // raw slab/Vec surgery above bypasses the maintained tables
+        // (R2 use-tables contract): re-derive before the final verify,
+        // whose V06 reads predecessors() from the table
+        g.rebuild_tables();
     }
     if let Err(e) = verify(&g) {
         return Err(format!("region_dce produced an invalid fabric: {}", e));
@@ -1075,6 +1083,11 @@ pub fn cfg_graft_inline(
         st.phis_built += st2.phis_built;
     }
 
+    // inline_one's region-level moves/relabels are raw slab surgery
+    // (MoveCell is inexpressible in the Edit vocabulary) — they bypass
+    // the maintained tables (R2 use-tables contract); re-derive before
+    // the final verify so V06 reads true predecessors
+    g.rebuild_tables();
     if let Err(e) = verify(&g) {
         return Err(format!("cfg_graft_inline produced an invalid fabric: {}", e));
     }
