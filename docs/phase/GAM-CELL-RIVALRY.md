@@ -22,7 +22,11 @@ demand economy is anchored to exogenous validated demand (kills
 back-scratch collusion structurally), BDI thresholds are priced by
 a control-run null rather than asserted, and one shared ring with
 lineage-as-ancestry-label replaces the ambiguous two-lineage
-framing.
+framing. Cross-pollinated same-day with two fleet repos
+(sunset-ecosystem, AgentGossip — §0.6, captain's order):
+corpse-graft inheritance, epilogue-shaped breeder failure records,
+and the anti-entropy reading of the observation channel are fleet
+kinship, cited file-level.
 
 ---
 
@@ -163,6 +167,119 @@ claimed is narrow: the composition — resource-local selection on a
 compiler IR whose safety rails are already proven, with LLM
 lineages as the mutation layer. Each ingredient exists; the
 composition and its measured kill conditions are the work.
+
+## 0.6 Prior art within the fleet (cross-pollination, 2026-08-31 — captain's order)
+
+Two SuperInstance repos were mined for this design the same day the
+draft committed (shallow clones under /tmp, files opened and cited;
+both repos predate the arena and neither knew of it — kinship, not
+co-design). What transferred, what was rejected, and one premise
+correction:
+
+**sunset-ecosystem** (`github.com/SuperInstance/sunset-ecosystem`,
+the fleet mothership: agents breed, sunset with dignity, and seed
+the next generation — `sunset/baton.py`'s daily sunset→seed→hatch
+cycle):
+
+- **TAKEN — corpse-graft inheritance** (from the whole
+  sunset/seed architecture: Epilogue + Onboarding documents
+  (`sunset/sunset_documents.py`), SeedBank (`sunset/seed_bank.py`),
+  TensorArchive (`sunset/tensor_archive.py`)). Sunset's answer to
+  "how does a loser exit without losing its adaptation" is that
+  the loser DECOMPOSES INTO SEEDS that inform the next generation.
+  The arena's legal form of the same move: when a cell dies, its
+  tombstoned genome participates as genetic material in the
+  winner's replication — the corpse donates one graft region to
+  the child, through the same rejection gate (§3.2 step 7,
+  amended). No seed bank, no archive, no global anything: the
+  corpse is LOCAL (it died in the winner's neighborhood) and its
+  fabric text is reconstructible from the Weft ledger (replay
+  machinery, `replay.rs`) — the M4 tombstone already carries the
+  content hash and witness, so corpse-graft adds zero storage and
+  zero new ontology. Death stops being erasure; adaptation is
+  absorbed, not archived. Note the complement with kill condition
+  2: lineage capture kills the LABEL while corpse-graft preserves
+  the MATERIAL — a swept lineage's useful regions can persist
+  inside the winner's descendants, which is exactly "losing
+  without losing the adaptation" and is measured as corpse-graft
+  uptake in the §7 table. Bounded: one graft region per corpse,
+  corpse material never claims a slot of its own (TensorArchive's
+  `wake()`-style reanimation is REJECTED for the arena:
+  resurrection competes with living offspring for slots;
+  corpse-graft is the only legal afterlife).
+- **TAKEN — epilogue-shaped breeder context** (from
+  `Onboarding.what_doesnt_work` / `Epilogue.why_not_relevant`).
+  The single most valuable thing a stud can know is what already
+  died and why. The breeder contract (§4.1) gains the lineage's
+  FAILURE RECORD: dead descendants' trailing behaviors and the
+  demand they failed to serve — mechanically derivable from Weft +
+  tombstones, no prose documents, no new state. This is sunset's
+  Onboarding letter made mechanical, and it strengthens the
+  no-shared-context principle rather than weakening it: the
+  failure record is the breeder's OWN lineage's failures, nothing
+  cross-lineage.
+- **TAKEN IN SPIRIT, priced not built — usage-decayed proposal
+  weights** (from SeedBank's selection weight
+  `relevance × novelty × 1/(1+times_selected)` — the anti-repeat
+  decay). If/when breeder menu-weight edits survive the spike, a
+  usage-decay term on the breeder's own inherited weights is the
+  honest anti-monoculture knob (a stud that keeps proposing the
+  same operator finds its own suggestions down-weighted). Frozen
+  default weights for blind draws are untouched by construction.
+  Follow-on knob, not spike scope.
+- **REJECTED with reason — MAP-Elites / QD archive for in-loop
+  selection** (`swarm/cvt_map_elites.py`, `swarm/exact_qd_archive.py`).
+  A quality-diversity archive is a global behavioral scoreboard
+  with a judge attached; installing it in-loop would re-create
+  exactly the shared judge §0 removes. ADOPTED for the MEASUREMENT
+  layer instead: offline Voronoi tessellation of behavior space
+  upgrades SPX's "≥2 distinct dominant actions" to a measured
+  niche-count (occupied-tile census over smoothed behavior
+  vectors) — offline, causally disconnected, legal by §1's own
+  rule. Sunset uses MAP-Elites to steer breeding; the arena will
+  use it only to SEE itself.
+
+**AgentGossip** (`github.com/SuperInstance/AgentGossip`):
+
+- **Premise correction, honestly logged:** the "intelligent
+  clustering" framing (captain's order, and the repo's own
+  README) is vestigial — `original/README.md` shows the repo began
+  as an unrelated upstream project and kept its name; the actual
+  fleet machinery (`src/ledger.ts`, `src/receipt.ts`,
+  `src/transport.ts`) is SWIM-style gossip over hash-chained cell
+  ledgers: lossy digest pings, anti-entropy pull for the heavy
+  lifting, sha256 mint receipts over pinned bytes (the quilt-esp32
+  critic-gate provenance bond, one level up). The 2026-08-30 org
+  scout called it "none" at README level — correct at the time for
+  compiler wiring; the rivalry arena is what makes it kin.
+- **TAKEN — the observation channel is an anti-entropy channel,
+  and that is theory-backed monoculture pressure.** AgentGossip's
+  core result shape — repeated digest/pull rounds converge
+  replicas — maps directly: cells observing neighbor action
+  counters and adapting is PHENOTYPIC anti-entropy, and its
+  default trajectory is convergence. This upgrades kill condition
+  1 (monoculture collapse) from "possible failure" to "expected
+  failure mode with a protocol theory behind it": the ring left
+  alone drifts toward synchronization, and the counter-forces
+  (spatial demand niches, mutation supply, the phase flip) are
+  what must overcome it. Measured, not assumed: strategy-spread
+  rate (how fast a behavior's phenotypic signature appears in
+  neighbors' smoothed vectors) joins the §7 table.
+- **TAKEN AS DOCTRINE — gossip without the pull.** The arena's
+  observation is digest-shaped (action counters), never
+  journal-shaped (programs): cells may see what neighbors DID,
+  never what neighbors ARE. AgentGossip's `Want`/pull mechanism —
+  the step that copies state between replicas — is exactly what
+  the arena forbids, and forbidding it is why phenotypic
+  convergence is possible but genotypic imitation is not. The
+  whole no-shared-context design, restated in fleet vocabulary:
+  run the gossip, withhold the pull.
+- **KINSHIP CITED — mint receipts.** The budget-ledger twin (§6:
+  pool mints, every claim a ledgered row, audit refuses on
+  mismatch) is the same provenance bond as AgentGossip's receipts
+  (sha256 over pinned bytes, receiver refuses disagreement) — a
+  pattern already proven in fleet code, one level down. No wiring
+  needed; cited so the lineage of the idea is on record.
 
 ## 1. The formal claim
 
@@ -360,9 +477,15 @@ spike scope — the spike's ring is in-process.
    neighbor, `crossover` (region graft) — **crossover crosses
    lineages freely**: one shared ring, lineage is an ancestry LABEL
    (§4.1), not a fence, and genetic competition mediated by the
-   arena IS the rivalry; then ONE mutation — menu draw, breeder
-   proposal (§4), or both with stated probability — through
-   rejection sampling; the child enters the slot only verify-green
+   arena IS the rivalry; **the corpse donates**: the tombstoned
+   genome (reconstructible from the Weft ledger, `replay.rs` —
+   zero new storage) contributes ONE graft region to the child,
+   through the same rejection gate — sunset-ecosystem's
+   seed-the-next-generation move in conservation-legal form (§0.6;
+   death stops being erasure, adaptation is absorbed, never
+   resurrected); then ONE mutation — menu draw, breeder proposal
+   (§4), or both with stated probability — through rejection
+   sampling; the child enters the slot only verify-green
    (rejections counted, per source). A rejected child leaves the
    slot empty this tick — persistent rejection thins the ring and
    kill condition 4 reads it.
@@ -471,11 +594,15 @@ not share the arena's code path.
   local outcomes (actions, budget consumed/delivered, validated
   demand hits, decay class), the freed slot's neighborhood demand
   profile, the mutation menu and verify constraints (fixed
-  boilerplate). NOTHING ELSE — in particular no cross-lineage data,
-  which the harness enforces by construction: the input does not
-  contain it. This is §0's no-shared-context principle applied one
-  level up: the breeders are as blind to each other as the cells
-  are.
+  boilerplate), and the lineage's FAILURE RECORD — dead
+  descendants' trailing behaviors and the demand they failed to
+  serve, derived from Weft + tombstones (sunset-ecosystem's
+  `Onboarding.what_doesnt_work` made mechanical, §0.6). NOTHING
+  ELSE — in particular no cross-lineage data, which the harness
+  enforces by construction: the input does not contain it. This is
+  §0's no-shared-context principle applied one level up: the
+  breeders are as blind to each other as the cells are, and the
+  failure record is the breeder's OWN lineage's failures only.
 - **What a breeder returns:** ONE mutation — a menu edit (which
   operator, where) or a mutation-menu weight change for that child.
   Machine-checked, applied through the same rejection gate as blind
@@ -616,12 +743,19 @@ quilt-rust integration in scope.
 
 **Measurements, published as one table at ticks 250/500/750/1000:**
 BDI, SPX, LS, per-cell η slopes, drift Δ, live-population count,
-per-breeder proposal entropy / rejection rate / survival (with the
-protocol-limited quarantine rule, §4.1), deaths and replications
-count, blind vs bred outcome split. All numbers from the offline
-pass over sealed Wefts. Kill conditions RIVALRY-COLLAPSE and
-ARENA-NULL are live from tick 1 (§2); HALT on any rail failure.
-Windows pre-registered: EWMA 50, drift 100, freeze 300 (§1).
+strategy-spread rate (how fast a behavior's phenotypic signature
+appears in neighbors' smoothed vectors — the anti-entropy pressure
+made visible, §0.6), per-breeder proposal entropy / rejection rate
+/ survival (with the protocol-limited quarantine rule, §4.1),
+deaths and replications count (with corpse-graft uptake — how
+often the dead genome's region survived into the child), blind vs
+bred outcome split. Offline niche census by Voronoi tessellation
+of behavior space (the MAP-Elites measurement borrow, §0.6)
+upgrades SPX's distinct-dominant-action count. All numbers from
+the offline pass over sealed Wefts. Kill conditions
+RIVALRY-COLLAPSE and ARENA-NULL are live from tick 1 (§2); HALT on
+any rail failure. Windows pre-registered: EWMA 50, drift 100,
+freeze 300 (§1).
 
 **Exit.** Any of: kill fires (published as the result); table shows
 differentiation with structure (BDI above collapse floor + SPX
@@ -704,6 +838,20 @@ Disposition:
   read `build · glm-5.3` rather than GLM-4.6; the review is archived
   as the opencode-lane voice without a confident sub-model
   attribution. The content stands on its own.
+
+**Cross-pollination pass (2026-08-31, captain's order — logged
+after the two-model review):** two SuperInstance repos mined
+(sunset-ecosystem, AgentGossip); dispositions in §0.6. Folded:
+corpse-graft inheritance (§3.2 step 7), epilogue-shaped failure
+record in the breeder contract (§4.1), strategy-spread rate and
+the Voronoi niche census in the §7 table, usage-decayed proposal
+weights as a priced follow-on knob. Rejected with reasons:
+MAP-Elites in-loop (global judge), TensorArchive wake/resurrection
+(competes with living offspring). Premise corrected: AgentGossip's
+"intelligent clustering" is vestigial README inheritance; the real
+machinery is digest/pull anti-entropy over sealed ledgers — which
+is what made the observation-channel-is-anti-entropy insight
+possible.
 
 *R5 conception lane, 2026-08-31. R4 bought a judge from outside the
 family; R5 removes the judge from the family album entirely — and
